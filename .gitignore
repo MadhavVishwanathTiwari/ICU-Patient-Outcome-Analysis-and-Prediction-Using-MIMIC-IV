@@ -47,14 +47,18 @@ data/raw/
 !data/processed/.gitkeep
 !data/interim/.gitkeep
 
-# Models (large files)
-models/*.pkl
+# Models - Include our trained models (they're reasonably sized at ~18MB total)
+# Only exclude very large model formats
 models/*.h5
 models/*.pt
-models/*.joblib
-*.pkl
 *.h5
 *.pt
+
+# Important: Allow .pkl files in models/ directory
+# but prevent accidental data leakage elsewhere
+*.pkl
+!models/*.pkl
+!models/**/*.pkl
 
 # Logs
 *.log
