@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Data files (DO NOT COMMIT RAW DATA)
+mimic-iv-2.2/
+mimic-iv-ed-2.2/
+*.csv
+*.csv.gz
+*.zip
+*.gz
+data/raw/
+!data/processed/.gitkeep
+!data/interim/.gitkeep
+
+# Models (large files)
+models/*.pkl
+models/*.h5
+models/*.pt
+models/*.joblib
+*.pkl
+*.h5
+*.pt
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Reports (keep code, ignore large outputs)
+reports/*.pdf
+reports/figures/*.png
+reports/figures/*.jpg
+
+# Environment variables
+.env
+.env.local
+
+# Temporary files
+*.tmp
+temp/
+tmp/
