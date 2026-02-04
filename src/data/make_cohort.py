@@ -9,10 +9,10 @@ This script:
 - Engineers target variables for outcome prediction
 - Saves the labeled cohort for downstream analysis
 
-Author: ML Healthcare Team
 Date: January 2026
 """
 
+import time
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -154,6 +154,40 @@ class CohortBuilder:
         print(f"  [OK] After adding patient info: {len(cohort):,} records")
         
         return cohort
+
+    def deduplicate_cohort(self, cohort: pd.DataFrame) -> pd.DataFrame:
+        """
+        Enforce uniqueness to prevent duplicate rows after joins.
+
+        Preferred uniqueness key is ICU `stay_id` (one row per ICU stay).
+        Falls back to other identifier combinations if `stay_id` is missing.
+        """
+        print("\n>> Deduplicating cohort...")
+
+        before = len(cohort)
+
+        if 'stay_id' in cohort.columns:
+            cohort = cohort.sort_values(['stay_id']).drop_duplicates(subset=['stay_id'], keep='first')
+            key_desc = "stay_id"
+        elif {'subject_id', 'hadm_id', 'intime'}.issubset(cohort.columns):
+            cohort = cohort.sort_values(['subject_id', 'hadm_id', 'intime']).drop_duplicates(
+                subset=['subject_id', 'hadm_id', 'intime'],
+                keep='first',
+            )
+            key_desc = "subject_id+hadm_id+intime"
+        elif {'subject_id', 'hadm_id'}.issubset(cohort.columns):
+            cohort = cohort.sort_values(['subject_id', 'hadm_id']).drop_duplicates(
+                subset=['subject_id', 'hadm_id'],
+                keep='first',
+            )
+            key_desc = "subject_id+hadm_id"
+        else:
+            cohort = cohort.drop_duplicates()
+            key_desc = "full row"
+
+        removed = before - len(cohort)
+        print(f"  [OK] Removed {removed:,} duplicate rows using {key_desc} (now {len(cohort):,})")
+        return cohort
     
     def apply_filters(self, cohort):
         """
@@ -278,12 +312,16 @@ class CohortBuilder:
         print("MIMIC-IV COHORT GENERATION")
         print("=" * 70)
         print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        
+        start_time = time.time()
+
         # Load data
         patients, admissions, icustays = self.load_data()
         
         # Merge datasets
         cohort = self.merge_datasets(patients, admissions, icustays)
+
+        # Prevent duplicates introduced by joins / upstream data issues
+        cohort = self.deduplicate_cohort(cohort)
         
         # Apply filters
         cohort = self.apply_filters(cohort)
@@ -300,7 +338,11 @@ class CohortBuilder:
         print(f"   Number of unique patients: {cohort['subject_id'].nunique():,}")
         print(f"   Features: {len(cohort.columns)} columns")
         print("=" * 70)
-        
+
+        end_time = time.time()
+        duration = end_time - start_time
+        print(f"   Execution time: {duration:.2f} seconds")
+        print("=" * 70)
         return cohort
     
     def save_cohort(self, cohort, output_path='data/processed/cohort_labeled.csv'):
