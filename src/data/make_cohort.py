@@ -226,14 +226,9 @@ class CohortBuilder:
         1. mortality (binary): In-hospital mortality
         2. los_days (continuous): ICU length of stay in days
         3. los_category (categorical): Short (<3d), Medium (3-7d), Long (>7d)
-        
-        Parameters:
-        -----------
-        cohort : pd.DataFrame
-        
-        Returns:
-        --------
-        pd.DataFrame : Cohort with target variables
+        4. icu_readmit_48h (binary): ICU readmission within 48 hours
+        5. icu_readmit_7d (binary): ICU readmission within 7 days
+        6. discharge_disposition (categorical): Home(0), Facility(1), Death(2)
         """
         print("\n>> Engineering target variables...")
         
@@ -243,7 +238,6 @@ class CohortBuilder:
         print(f"  [OK] Mortality rate: {mortality_rate:.2f}%")
         
         # Target 2: Length of Stay in Days (continuous)
-        # MIMIC-IV 'los' is in days (not hours as in MIMIC-III)
         cohort['los_days'] = cohort['los'].astype(float)
         print(f"  [OK] LOS range: {cohort['los_days'].min():.2f} - {cohort['los_days'].max():.2f} days")
         print(f"  [OK] Mean LOS: {cohort['los_days'].mean():.2f} days (median: {cohort['los_days'].median():.2f})")
@@ -261,6 +255,71 @@ class CohortBuilder:
         print(f"      - Short (<3 days): {los_dist[0]:,} ({los_dist[0]/len(cohort)*100:.1f}%)")
         print(f"      - Medium (3-7 days): {los_dist[1]:,} ({los_dist[1]/len(cohort)*100:.1f}%)")
         print(f"      - Long (>7 days): {los_dist[2]:,} ({los_dist[2]/len(cohort)*100:.1f}%)")
+        
+        # Target 4 & 5: ICU Readmission within 48h / 7d
+        cohort = self._add_readmission_labels(cohort)
+        
+        # Target 6: Discharge Disposition (Home / Facility / Death)
+        cohort = self._add_discharge_disposition(cohort)
+        
+        return cohort
+
+    def _add_readmission_labels(self, cohort):
+        """Compute ICU readmission flags by looking at sequential stays per patient."""
+        print("\n>> Computing ICU readmission labels...")
+        
+        cohort = cohort.sort_values(['subject_id', 'intime']).copy()
+        cohort['next_intime'] = cohort.groupby('subject_id')['intime'].shift(-1)
+        
+        hours_to_next = (
+            (cohort['next_intime'] - cohort['outtime']).dt.total_seconds() / 3600
+        )
+        
+        cohort['icu_readmit_48h'] = (
+            (hours_to_next > 0) & (hours_to_next <= 48)
+        ).astype(int)
+        cohort['icu_readmit_7d'] = (
+            (hours_to_next > 0) & (hours_to_next <= 168)
+        ).astype(int)
+        
+        # Patients who died cannot readmit
+        died = cohort['hospital_expire_flag'] == 1
+        cohort.loc[died, ['icu_readmit_48h', 'icu_readmit_7d']] = 0
+        
+        # Fill NaN (last stay per patient has no next stay)
+        cohort['icu_readmit_48h'] = cohort['icu_readmit_48h'].fillna(0).astype(int)
+        cohort['icu_readmit_7d'] = cohort['icu_readmit_7d'].fillna(0).astype(int)
+        
+        cohort.drop(columns=['next_intime'], inplace=True)
+        
+        r48 = cohort['icu_readmit_48h'].mean() * 100
+        r7d = cohort['icu_readmit_7d'].mean() * 100
+        print(f"  [OK] 48h readmission rate: {r48:.2f}%")
+        print(f"  [OK] 7d readmission rate:  {r7d:.2f}%")
+        
+        return cohort
+
+    def _add_discharge_disposition(self, cohort):
+        """Map discharge_location to Home(0) / Facility(1) / Death(2)."""
+        print("\n>> Computing discharge disposition labels...")
+        
+        home_keywords = ['HOME']
+        
+        def _map(row):
+            if row.get('hospital_expire_flag', 0) == 1:
+                return 2
+            loc = str(row.get('discharge_location', '')).upper()
+            for kw in home_keywords:
+                if kw in loc:
+                    return 0
+            return 1
+        
+        cohort['discharge_disposition'] = cohort.apply(_map, axis=1)
+        
+        dd = cohort['discharge_disposition'].value_counts().sort_index()
+        labels = {0: 'Home', 1: 'Facility', 2: 'Death'}
+        for k in sorted(dd.index):
+            print(f"  [OK] {labels.get(k, k)}: {dd[k]:,} ({dd[k]/len(cohort)*100:.1f}%)")
         
         return cohort
     
@@ -292,7 +351,10 @@ class CohortBuilder:
         time_cols = ['admittime', 'dischtime', 'intime', 'outtime']
         
         # Target variables
-        target_cols = ['mortality', 'los_days', 'los_category']
+        target_cols = [
+            'mortality', 'los_days', 'los_category',
+            'icu_readmit_48h', 'icu_readmit_7d', 'discharge_disposition'
+        ]
         
         # Select available columns
         all_cols = id_cols + demo_cols + admission_cols + time_cols + target_cols

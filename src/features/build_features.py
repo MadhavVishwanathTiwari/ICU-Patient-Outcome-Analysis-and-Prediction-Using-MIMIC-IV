@@ -62,11 +62,15 @@ class FeatureEngineer:
         )
         print(f"[OK] Loaded {len(self.cohort):,} ICU stays")
         
-        # Initialize features dataframe with identifiers and targets
-        self.features = self.cohort[[
-            'subject_id', 'hadm_id', 'stay_id',
-            'mortality', 'los_days', 'los_category'
-        ]].copy()
+        # Initialize features dataframe with identifiers and all targets
+        target_cols = [
+            'mortality', 'los_days', 'los_category',
+            'icu_readmit_48h', 'icu_readmit_7d', 'discharge_disposition'
+        ]
+        available_targets = [c for c in target_cols if c in self.cohort.columns]
+        self.features = self.cohort[
+            ['subject_id', 'hadm_id', 'stay_id'] + available_targets
+        ].copy()
         
         return self.cohort
     
@@ -409,33 +413,164 @@ class FeatureEngineer:
         
         return self.features
     
+    # ------------------------------------------------------------------
+    # Phase 2B: Organ Support target extraction
+    # ------------------------------------------------------------------
+
+    def extract_ventilation_targets(self):
+        """Flag stays with any mechanical ventilation event (chunked for low-RAM)."""
+        print("\n" + "=" * 70)
+        print("EXTRACTING VENTILATION TARGETS")
+        print("=" * 70)
+        vent_stays = set()
+        cohort_stays = set(self.features['stay_id'].dropna().astype('int64'))
+        try:
+            chunk_size = 2_000_000
+            for i, chunk in enumerate(pd.read_csv(
+                self.icu_dir / 'chartevents.csv.gz', compression='gzip',
+                usecols=['stay_id', 'itemid'], dtype={'stay_id': 'int64', 'itemid': 'int32'},
+                chunksize=chunk_size
+            )):
+                if (i + 1) % 50 == 0:
+                    print(f"    Processing chartevents chunk {i+1}... ({len(vent_stays):,} vent stays found)")
+                subset = chunk[
+                    (chunk['itemid'].isin(VENT_ITEMIDS)) &
+                    (chunk['stay_id'].isin(cohort_stays))
+                ]
+                vent_stays.update(subset['stay_id'].unique().tolist())
+            self.features['need_vent_any'] = self.features['stay_id'].isin(vent_stays).astype(int)
+            print(f"  [OK] Ventilation rate: {self.features['need_vent_any'].mean()*100:.1f}%")
+        except Exception as e:
+            print(f"  [WARNING] Could not load chartevents for vent: {e}")
+            self.features['need_vent_any'] = 0
+        return self.features
+
+    def extract_vasopressor_targets(self):
+        """Flag stays with any vasopressor infusion."""
+        print("\n" + "=" * 70)
+        print("EXTRACTING VASOPRESSOR TARGETS")
+        print("=" * 70)
+        try:
+            inputevents = pd.read_csv(
+                self.icu_dir / 'inputevents.csv.gz', compression='gzip',
+                usecols=['stay_id', 'itemid', 'amount'], dtype={'itemid': 'int32'}
+            )
+            vaso_stays = inputevents[
+                (inputevents['itemid'].isin(VASOPRESSOR_ITEMIDS)) &
+                (inputevents['amount'] > 0)
+            ]['stay_id'].unique()
+            self.features['need_vasopressor_any'] = self.features['stay_id'].isin(vaso_stays).astype(int)
+            print(f"  [OK] Vasopressor rate: {self.features['need_vasopressor_any'].mean()*100:.1f}%")
+        except Exception as e:
+            print(f"  [WARNING] Could not load inputevents for vasopressors: {e}")
+            self.features['need_vasopressor_any'] = 0
+        return self.features
+
+    def extract_rrt_targets(self):
+        """Flag stays with any renal replacement therapy."""
+        print("\n" + "=" * 70)
+        print("EXTRACTING RRT TARGETS")
+        print("=" * 70)
+        rrt_stays = set()
+        try:
+            proc_events = pd.read_csv(
+                self.icu_dir / 'procedureevents.csv.gz', compression='gzip',
+                usecols=['stay_id', 'itemid'], dtype={'itemid': 'int32'}
+            )
+            rrt_stays.update(
+                proc_events[proc_events['itemid'].isin(RRT_ITEMIDS)]['stay_id'].unique()
+            )
+        except Exception as e:
+            print(f"  [WARNING] Could not load procedureevents: {e}")
+        try:
+            proc_icd = pd.read_csv(
+                self.hosp_dir / 'procedures_icd.csv.gz', compression='gzip'
+            )
+            cohort_hadm = self.cohort[['hadm_id', 'stay_id']].drop_duplicates()
+            proc_icd = proc_icd.merge(cohort_hadm, on='hadm_id', how='inner')
+            dialysis_codes = proc_icd[
+                proc_icd['icd_code'].str.contains('5A1D', na=False)
+            ]['stay_id'].unique()
+            rrt_stays.update(dialysis_codes)
+        except Exception as e:
+            print(f"  [WARNING] Could not load procedures_icd for RRT: {e}")
+        self.features['need_rrt_any'] = self.features['stay_id'].isin(rrt_stays).astype(int)
+        print(f"  [OK] RRT rate: {self.features['need_rrt_any'].mean()*100:.1f}%")
+        return self.features
+
+    # ------------------------------------------------------------------
+    # Phase 3A/3B: Disease onset + sepsis targets
+    # ------------------------------------------------------------------
+
+    def extract_clinical_targets(self):
+        """Compute AKI, ARDS, liver injury, and sepsis onset labels."""
+        print("\n" + "=" * 70)
+        print("EXTRACTING CLINICAL ONSET TARGETS (AKI, ARDS, Liver, Sepsis)")
+        print("=" * 70)
+        try:
+            from src.features.clinical_targets import (
+                compute_aki_labels, compute_ards_labels,
+                compute_liver_injury_labels, compute_sepsis_labels
+            )
+        except ImportError:
+            try:
+                from features.clinical_targets import (
+                    compute_aki_labels, compute_ards_labels,
+                    compute_liver_injury_labels, compute_sepsis_labels
+                )
+            except ImportError:
+                print("  [WARNING] clinical_targets module not found, skipping")
+                for col in ['aki_onset', 'ards_onset', 'liver_injury_onset', 'sepsis_onset']:
+                    self.features[col] = 0
+                return self.features
+
+        self.features = compute_aki_labels(self.features, self.cohort, self.hosp_dir)
+        self.features = compute_ards_labels(self.features, self.cohort, self.hosp_dir, self.icu_dir)
+        self.features = compute_liver_injury_labels(self.features, self.cohort, self.hosp_dir)
+        self.features = compute_sepsis_labels(self.features, self.cohort, self.hosp_dir, self.icu_dir)
+        return self.features
+
+    # ------------------------------------------------------------------
+    # Main pipeline
+    # ------------------------------------------------------------------
+
     def build_feature_matrix(self):
-        """
-        Main pipeline to build the complete feature matrix.
-        """
+        """Main pipeline to build the complete feature matrix."""
         print("\n" + "=" * 70)
         print("MIMIC-IV FEATURE ENGINEERING PIPELINE")
         print("=" * 70)
         print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # Load cohort
         self.load_cohort()
         
-        # Extract features
+        # Existing feature extraction
         self.extract_diagnosis_features(top_n=TOP_N_DIAGNOSES)
         self.extract_procedure_features(top_n=TOP_N_PROCEDURES)
         self.extract_demographic_features()
         self.extract_temporal_features()
         
-        # Note: Lab features are optional due to large file size
-        # Uncomment if you have enough memory:
-        # self.extract_lab_features(window_hours=24)
+        # Phase 2B: Organ support targets
+        self.extract_ventilation_targets()
+        self.extract_vasopressor_targets()
+        self.extract_rrt_targets()
+        
+        # Phase 3A/3B: Disease onset targets
+        self.extract_clinical_targets()
+        
+        n_id_target = len([c for c in self.features.columns
+                           if c in {'subject_id','hadm_id','stay_id',
+                                    'mortality','los_days','los_category',
+                                    'icu_readmit_48h','icu_readmit_7d',
+                                    'discharge_disposition',
+                                    'need_vent_any','need_vasopressor_any','need_rrt_any',
+                                    'aki_onset','ards_onset','liver_injury_onset','sepsis_onset'}])
         
         print("\n" + "=" * 70)
         print("FEATURE ENGINEERING COMPLETE")
         print("=" * 70)
         print(f"  Final feature matrix shape: {self.features.shape}")
-        print(f"  Total features: {len(self.features.columns) - 6} (excluding IDs and targets)")
+        print(f"  Total features: {len(self.features.columns) - n_id_target} (excluding IDs and targets)")
+        print(f"  Target columns: {n_id_target - 3}")
         print(f"  ICU stays: {len(self.features):,}")
         
         return self.features

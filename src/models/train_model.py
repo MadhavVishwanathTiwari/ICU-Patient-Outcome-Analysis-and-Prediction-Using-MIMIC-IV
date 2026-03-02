@@ -85,45 +85,47 @@ class ModelTrainer:
         
         return self.data
     
+    # All possible target columns across the pipeline
+    ALL_TARGET_COLS = [
+        'mortality', 'los_days', 'los_category',
+        'icu_readmit_48h', 'icu_readmit_7d', 'discharge_disposition',
+        'need_vent_any', 'need_vasopressor_any', 'need_rrt_any',
+        'aki_onset', 'ards_onset', 'liver_injury_onset', 'sepsis_onset'
+    ]
+
     def prepare_data(self, task='mortality'):
         """
-        Prepare data for modeling.
-        
-        Parameters:
-        -----------
-        task : str
-            Prediction task: 'mortality', 'los_regression', or 'los_classification'
-        
-        Returns:
-        --------
-        tuple : (X_train, X_val, X_test, y_train, y_val, y_test)
+        Prepare data for modeling.  Accepts any target column name.
         """
         print("\n" + "=" * 70)
         print(f"PREPARING DATA FOR: {task.upper()}")
         print("=" * 70)
         
-        # Separate features and targets
         id_cols = ['subject_id', 'hadm_id', 'stay_id']
-        target_cols = ['mortality', 'los_days', 'los_category']
+        drop_cols = id_cols + [c for c in self.ALL_TARGET_COLS if c in self.data.columns]
         
-        X = self.data.drop(columns=id_cols + target_cols)
+        X = self.data.drop(columns=[c for c in drop_cols if c in self.data.columns])
         
-        # Select target based on task
-        if task == 'mortality':
-            y = self.data['mortality']
-        elif task == 'los_regression':
+        if task == 'los_regression':
             y = self.data['los_days']
-        elif task == 'los_classification':
-            y = self.data['los_category']
+        elif task in self.data.columns:
+            y = self.data[task]
         else:
-            raise ValueError(f"Unknown task: {task}")
+            raise ValueError(f"Unknown task / column not found: {task}")
         
+        MULTICLASS_TASKS = {'los_category', 'discharge_disposition'}
+
         print(f"  [OK] Features shape: {X.shape}")
         print(f"  [OK] Target distribution:")
-        if task in ['mortality', 'los_classification']:
-            print(f"       {y.value_counts().to_dict()}")
-        else:
+        if task == 'los_regression':
             print(f"       Mean: {y.mean():.2f}, Std: {y.std():.2f}")
+        elif task in MULTICLASS_TASKS:
+            counts = y.value_counts().sort_index().to_dict()
+            print(f"       {counts}")
+        else:
+            counts = y.value_counts().sort_index().to_dict()
+            print(f"       {counts}")
+            print(f"       Positive rate: {y.mean()*100:.1f}%")
         
         # Split data: 60% train, 20% validation, 20% test
         X_temp, X_test, y_temp, y_test = train_test_split(
@@ -153,8 +155,8 @@ class ModelTrainer:
         
         print(f"     [OK] Features scaled")
         
-        # Handle class imbalance for classification tasks
-        if task in ['mortality', 'los_classification'] and HANDLE_IMBALANCE:
+        # Handle class imbalance for mortality only (SMOTE used in _train_binary_xgb for others)
+        if task == 'mortality' and HANDLE_IMBALANCE:
             print(f"\n  -> Handling class imbalance with SMOTE...")
             smote = SMOTE(random_state=RANDOM_SEED)
             X_train, y_train = smote.fit_resample(X_train, y_train)
@@ -281,7 +283,7 @@ class ModelTrainer:
         print("=" * 70)
         
         # Prepare data
-        X_train, X_val, X_test, y_train, y_val, y_test = self.prepare_data(task='los_classification')
+        X_train, X_val, X_test, y_train, y_val, y_test = self.prepare_data(task='los_category')
         
         results = {}
         
@@ -371,29 +373,167 @@ class ModelTrainer:
         
         return results
     
+    # ------------------------------------------------------------------
+    # Generic binary XGBoost trainer (reused for new targets)
+    # ------------------------------------------------------------------
+
+    # Targets where SMOTE hurts (insufficient temporal signal; oversampling adds noise)
+    SMOTE_SKIP_TARGETS = {'icu_readmit_48h', 'icu_readmit_7d'}
+
+    def _train_binary_xgb(self, task_name: str, target_col: str):
+        """Train a single XGBoost binary classifier for *target_col*.
+
+        Imbalance handling strategy:
+          - scale_pos_weight = n_neg/n_pos for all binary targets
+          - SMOTE applied when positive rate < 10%, EXCEPT for readmission
+            targets where it was shown to degrade performance
+        """
+        if target_col not in self.data.columns:
+            print(f"  [SKIP] {target_col} not in data")
+            return
+        if self.data[target_col].nunique() < 2:
+            print(f"  [SKIP] {target_col} has only one class")
+            return
+
+        print(f"\n{'=' * 70}")
+        print(f"TRAINING: {task_name}")
+        print(f"{'=' * 70}")
+
+        X_train, X_val, X_test, y_train, y_val, y_test = self.prepare_data(task=target_col)
+
+        # Compute class weight ratio for XGBoost
+        n_neg = int((y_train == 0).sum())
+        n_pos = int((y_train == 1).sum())
+        spw = round(n_neg / n_pos, 2) if n_pos > 0 else 1.0
+        pos_rate = n_pos / (n_neg + n_pos)
+
+        # SMOTE for severely imbalanced targets, skipped where it degrades signal
+        use_smote = (pos_rate < 0.10
+                     and HANDLE_IMBALANCE
+                     and target_col not in self.SMOTE_SKIP_TARGETS)
+        if use_smote:
+            print(f"  -> Positive rate {pos_rate*100:.1f}% - applying SMOTE + scale_pos_weight={spw}")
+            smote = SMOTE(random_state=RANDOM_SEED)
+            X_train, y_train = smote.fit_resample(X_train, y_train)
+            n_neg = int((y_train == 0).sum())
+            n_pos = int((y_train == 1).sum())
+            spw = round(n_neg / n_pos, 2)
+            print(f"     [OK] After SMOTE: {len(X_train):,} samples, spw={spw}")
+        else:
+            if target_col in self.SMOTE_SKIP_TARGETS:
+                print(f"  -> Positive rate {pos_rate*100:.1f}% - SMOTE skipped (readmission); scale_pos_weight={spw}")
+            else:
+                print(f"  -> scale_pos_weight={spw}")
+
+        model = xgb.XGBClassifier(**XGBOOST_PARAMS, eval_metric='logloss',
+                                   scale_pos_weight=spw)
+        model.fit(X_train, y_train)
+
+        val_pred = model.predict(X_val)
+        val_proba = model.predict_proba(X_val)[:, 1]
+
+        val_metrics = {
+            'accuracy': float(accuracy_score(y_val, val_pred)),
+            'precision': float(precision_score(y_val, val_pred, zero_division=0)),
+            'recall': float(recall_score(y_val, val_pred, zero_division=0)),
+            'f1': float(f1_score(y_val, val_pred, zero_division=0)),
+            'roc_auc': float(roc_auc_score(y_val, val_proba))
+        }
+        print(f"  [VAL] ROC-AUC: {val_metrics['roc_auc']:.4f}  F1: {val_metrics['f1']:.4f}")
+
+        test_pred = model.predict(X_test)
+        test_proba = model.predict_proba(X_test)[:, 1]
+        test_metrics = {
+            'accuracy': float(accuracy_score(y_test, test_pred)),
+            'precision': float(precision_score(y_test, test_pred, zero_division=0)),
+            'recall': float(recall_score(y_test, test_pred, zero_division=0)),
+            'f1': float(f1_score(y_test, test_pred, zero_division=0)),
+            'roc_auc': float(roc_auc_score(y_test, test_proba))
+        }
+        print(f"  [TEST] ROC-AUC: {test_metrics['roc_auc']:.4f}  F1: {test_metrics['f1']:.4f}")
+
+        model_key = target_col + '_xgb'
+        self.models[model_key] = model
+        self.results[target_col] = {
+            'validation': val_metrics,
+            'test': test_metrics,
+            'best_model': 'xgboost'
+        }
+
+    def train_readmission_models(self):
+        self._train_binary_xgb('ICU Readmission 48h', 'icu_readmit_48h')
+        self._train_binary_xgb('ICU Readmission 7d', 'icu_readmit_7d')
+
+    def train_discharge_disposition_model(self):
+        """3-class XGBoost for discharge disposition."""
+        target = 'discharge_disposition'
+        if target not in self.data.columns:
+            return
+        print(f"\n{'=' * 70}")
+        print("TRAINING: Discharge Disposition (3-class)")
+        print(f"{'=' * 70}")
+
+        X_train, X_val, X_test, y_train, y_val, y_test = self.prepare_data(task=target)
+        model = xgb.XGBClassifier(**XGBOOST_PARAMS, eval_metric='mlogloss',
+                                   num_class=3, objective='multi:softprob')
+        model.fit(X_train, y_train)
+
+        val_pred = model.predict(X_val)
+        val_metrics = {
+            'accuracy': float(accuracy_score(y_val, val_pred)),
+            'f1_macro': float(f1_score(y_val, val_pred, average='macro', zero_division=0))
+        }
+        test_pred = model.predict(X_test)
+        test_metrics = {
+            'accuracy': float(accuracy_score(y_test, test_pred)),
+            'f1_macro': float(f1_score(y_test, test_pred, average='macro', zero_division=0))
+        }
+        print(f"  [VAL]  Accuracy: {val_metrics['accuracy']:.4f}  F1-macro: {val_metrics['f1_macro']:.4f}")
+        print(f"  [TEST] Accuracy: {test_metrics['accuracy']:.4f}  F1-macro: {test_metrics['f1_macro']:.4f}")
+
+        self.models['discharge_disposition_xgb'] = model
+        self.results['discharge_disposition'] = {
+            'validation': val_metrics, 'test': test_metrics, 'best_model': 'xgboost'
+        }
+
+    def train_organ_support_models(self):
+        self._train_binary_xgb('Ventilation Need', 'need_vent_any')
+        self._train_binary_xgb('Vasopressor Need', 'need_vasopressor_any')
+        self._train_binary_xgb('RRT Need', 'need_rrt_any')
+
+    def train_disease_onset_models(self):
+        self._train_binary_xgb('AKI Onset', 'aki_onset')
+        self._train_binary_xgb('ARDS Onset', 'ards_onset')
+        self._train_binary_xgb('Liver Injury Onset', 'liver_injury_onset')
+        self._train_binary_xgb('Sepsis Onset', 'sepsis_onset')
+
+    # ------------------------------------------------------------------
+
     def train_all_models(self):
-        """
-        Train models for all prediction tasks.
-        """
+        """Train models for all prediction tasks."""
         print("\n" + "=" * 70)
         print("MIMIC-IV MODEL TRAINING PIPELINE")
         print("=" * 70)
         print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # Load data
         self.load_data()
         
-        # Train mortality models
+        # Core targets
         self.train_mortality_models()
-        
-        # Train LOS classification models
         self.train_los_classification_models()
+        
+        # Extended targets
+        self.train_readmission_models()
+        self.train_discharge_disposition_model()
+        self.train_organ_support_models()
+        self.train_disease_onset_models()
         
         print("\n" + "=" * 70)
         print("MODEL TRAINING COMPLETE")
         print("=" * 70)
         print(f"  Trained {len(self.models)} models")
-        print(f"  Tasks completed: 2 (Mortality, LOS Classification)")
+        task_list = list(self.results.keys())
+        print(f"  Tasks completed: {len(task_list)} ({', '.join(task_list)})")
         
         return self.results
     

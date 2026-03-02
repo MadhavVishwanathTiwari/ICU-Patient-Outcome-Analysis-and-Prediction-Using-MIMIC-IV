@@ -36,17 +36,36 @@ st.set_page_config(
 def load_models():
     """Load trained models and scaler."""
     models_dir = Path('models')
-    
-    models = {
-        'mortality_xgb': joblib.load(models_dir / 'mortality_xgb.pkl'),
-        'los_class_xgb': joblib.load(models_dir / 'los_class_xgb.pkl'),
-        'scaler': joblib.load(models_dir / 'scaler.pkl')
+
+    required = {
+        'mortality_xgb': 'mortality_xgb.pkl',
+        'los_class_xgb': 'los_class_xgb.pkl',
+        'scaler': 'scaler.pkl',
     }
-    
-    # Load results
+    optional = {
+        'icu_readmit_48h_xgb': 'icu_readmit_48h_xgb.pkl',
+        'icu_readmit_7d_xgb': 'icu_readmit_7d_xgb.pkl',
+        'discharge_disposition_xgb': 'discharge_disposition_xgb.pkl',
+        'need_vent_any_xgb': 'need_vent_any_xgb.pkl',
+        'need_vasopressor_any_xgb': 'need_vasopressor_any_xgb.pkl',
+        'need_rrt_any_xgb': 'need_rrt_any_xgb.pkl',
+        'aki_onset_xgb': 'aki_onset_xgb.pkl',
+        'ards_onset_xgb': 'ards_onset_xgb.pkl',
+        'liver_injury_onset_xgb': 'liver_injury_onset_xgb.pkl',
+        'sepsis_onset_xgb': 'sepsis_onset_xgb.pkl',
+    }
+
+    models = {}
+    for key, fname in required.items():
+        models[key] = joblib.load(models_dir / fname)
+    for key, fname in optional.items():
+        path = models_dir / fname
+        if path.exists():
+            models[key] = joblib.load(path)
+
     with open(models_dir / 'results.json', 'r') as f:
         results = json.load(f)
-    
+
     return models, results
 
 @st.cache_data
@@ -97,23 +116,35 @@ def show_dashboard(data, results):
     """Display main dashboard with overview statistics."""
     st.header("Dashboard Overview")
     
-    # Key metrics
+    # Key metrics — row 1
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric("Total ICU Stays", f"{len(data):,}")
-    
     with col2:
         mortality_rate = data['mortality'].mean() * 100
         st.metric("Mortality Rate", f"{mortality_rate:.2f}%")
-    
     with col3:
         mean_los = data['los_days'].mean()
         st.metric("Mean LOS", f"{mean_los:.2f} days")
-    
     with col4:
-        model_roc = results['mortality']['test']['roc_auc']
-        st.metric("Model ROC-AUC", f"{model_roc:.4f}")
+        model_roc = results.get('mortality', {}).get('test', {}).get('roc_auc', 0)
+        st.metric("Mortality ROC-AUC", f"{model_roc:.4f}")
+
+    # Key metrics — row 2 (new targets)
+    col5, col6, col7, col8 = st.columns(4)
+    with col5:
+        if 'icu_readmit_7d' in data.columns:
+            st.metric("7d Readmit Rate", f"{data['icu_readmit_7d'].mean()*100:.1f}%")
+    with col6:
+        if 'need_vent_any' in data.columns:
+            st.metric("Vent Rate", f"{data['need_vent_any'].mean()*100:.1f}%")
+    with col7:
+        if 'aki_onset' in data.columns:
+            st.metric("AKI Rate", f"{data['aki_onset'].mean()*100:.1f}%")
+    with col8:
+        if 'sepsis_onset' in data.columns:
+            st.metric("Sepsis Rate", f"{data['sepsis_onset'].mean()*100:.1f}%")
     
     st.markdown("---")
     
@@ -180,8 +211,15 @@ def show_predictions(models, data):
     with col3:
         st.info(f"**Actual Mortality:** {'Yes' if patient['mortality'] == 1 else 'No'}")
     
-    # Prepare features
-    feature_cols = [col for col in data.columns if col not in ['subject_id', 'hadm_id', 'stay_id', 'mortality', 'los_days', 'los_category']]
+    # Prepare features — exclude IDs and all target columns
+    exclude = {
+        'subject_id', 'hadm_id', 'stay_id',
+        'mortality', 'los_days', 'los_category',
+        'icu_readmit_48h', 'icu_readmit_7d', 'discharge_disposition',
+        'need_vent_any', 'need_vasopressor_any', 'need_rrt_any',
+        'aki_onset', 'ards_onset', 'liver_injury_onset', 'sepsis_onset'
+    }
+    feature_cols = [c for c in data.columns if c not in exclude]
     X = patient[feature_cols].values.reshape(1, -1)
     X_scaled = models['scaler'].transform(X)
     
@@ -249,19 +287,117 @@ def show_predictions(models, data):
         st.markdown(f"**Predicted Category:** :blue[{predicted_category}]")
         st.markdown(f"**Confidence:** {los_proba[los_pred]*100:.1f}%")
     
-    # Actual outcomes
+    # -------- Readmission risk --------
+    st.markdown("---")
+    st.subheader("ICU Readmission Risk")
+    rc1, rc2 = st.columns(2)
+    for col_ui, key, label in [
+        (rc1, 'icu_readmit_48h_xgb', '48-Hour'),
+        (rc2, 'icu_readmit_7d_xgb', '7-Day')
+    ]:
+        with col_ui:
+            if key in models:
+                prob = models[key].predict_proba(X_scaled)[0][1]
+                fig = go.Figure(go.Indicator(
+                    mode="gauge+number", value=prob * 100,
+                    title={'text': f"{label} Readmit Risk (%)"},
+                    gauge={'axis': {'range': [0, 100]},
+                           'steps': [{'range': [0, 20], 'color': 'lightgreen'},
+                                     {'range': [20, 50], 'color': 'yellow'},
+                                     {'range': [50, 100], 'color': 'red'}]}
+                ))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info(f"{label} readmission model not trained yet.")
+
+    # -------- Discharge Disposition --------
+    if 'discharge_disposition_xgb' in models:
+        st.markdown("---")
+        st.subheader("Discharge Disposition Prediction")
+        dd_proba = models['discharge_disposition_xgb'].predict_proba(X_scaled)[0]
+        dd_labels = ['Home', 'Facility', 'Death']
+        fig = px.bar(x=dd_labels, y=dd_proba * 100,
+                     color=dd_labels,
+                     color_discrete_sequence=['#00cc96', '#ffa15a', '#ef553b'])
+        fig.update_layout(showlegend=False, xaxis_title="", yaxis_title="Probability (%)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # -------- Organ Support --------
+    st.markdown("---")
+    st.subheader("Organ Support Predictions")
+    os1, os2, os3 = st.columns(3)
+    for col_ui, key, label in [
+        (os1, 'need_vent_any_xgb', 'Mechanical Ventilation'),
+        (os2, 'need_vasopressor_any_xgb', 'Vasopressors'),
+        (os3, 'need_rrt_any_xgb', 'Renal Replacement')
+    ]:
+        with col_ui:
+            if key in models:
+                prob = models[key].predict_proba(X_scaled)[0][1]
+                st.metric(label, f"{prob*100:.1f}%")
+                st.progress(float(min(prob, 1.0)))
+            else:
+                st.info(f"{label} model not trained.")
+
+    # -------- Disease Onset --------
+    st.markdown("---")
+    st.subheader("Complication Onset Risk")
+    dc1, dc2, dc3, dc4 = st.columns(4)
+    for col_ui, key, label in [
+        (dc1, 'aki_onset_xgb', 'AKI'),
+        (dc2, 'ards_onset_xgb', 'ARDS'),
+        (dc3, 'liver_injury_onset_xgb', 'Liver Injury'),
+        (dc4, 'sepsis_onset_xgb', 'Sepsis')
+    ]:
+        with col_ui:
+            if key in models:
+                prob = models[key].predict_proba(X_scaled)[0][1]
+                st.metric(label, f"{prob*100:.1f}%")
+                st.progress(float(min(prob, 1.0)))
+            else:
+                st.info(f"{label} model N/A")
+
+    # -------- Actual Outcomes --------
     st.markdown("---")
     st.subheader("Actual Outcomes")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        actual_mortality = "Yes" if patient['mortality'] == 1 else "No"
-        st.success(f"**Actual Mortality:** {actual_mortality}")
-    
-    with col2:
-        actual_los = los_labels[int(patient['los_category'])]
-        st.success(f"**Actual LOS Category:** {actual_los}")
+
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        st.success(f"**Mortality:** {'Yes' if patient['mortality'] == 1 else 'No'}")
+    with a2:
+        st.success(f"**LOS:** {los_labels[int(patient['los_category'])]}")
+    with a3:
+        if 'icu_readmit_48h' in patient.index:
+            st.info(f"**Readmit 48h:** {'Yes' if patient['icu_readmit_48h'] == 1 else 'No'}")
+    with a4:
+        if 'icu_readmit_7d' in patient.index:
+            st.info(f"**Readmit 7d:** {'Yes' if patient['icu_readmit_7d'] == 1 else 'No'}")
+
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if 'discharge_disposition' in patient.index:
+            dd_map = {0: 'Home', 1: 'Facility', 2: 'Death'}
+            st.info(f"**Discharge:** {dd_map.get(int(patient['discharge_disposition']), 'Unknown')}")
+    with b2:
+        if 'need_vent_any' in patient.index:
+            st.info(f"**Ventilation:** {'Yes' if patient['need_vent_any'] == 1 else 'No'}")
+    with b3:
+        if 'need_vasopressor_any' in patient.index:
+            st.info(f"**Vasopressors:** {'Yes' if patient['need_vasopressor_any'] == 1 else 'No'}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        if 'need_rrt_any' in patient.index:
+            st.info(f"**RRT:** {'Yes' if patient['need_rrt_any'] == 1 else 'No'}")
+    with c2:
+        if 'aki_onset' in patient.index:
+            st.info(f"**AKI:** {'Yes' if patient['aki_onset'] == 1 else 'No'}")
+    with c3:
+        if 'ards_onset' in patient.index:
+            st.info(f"**ARDS:** {'Yes' if patient['ards_onset'] == 1 else 'No'}")
+    with c4:
+        if 'sepsis_onset' in patient.index:
+            st.info(f"**Sepsis:** {'Yes' if patient['sepsis_onset'] == 1 else 'No'}")
 
 def show_model_performance(results):
     """Display model performance metrics."""
@@ -328,6 +464,37 @@ def show_model_performance(results):
     col3.metric("Recall", f"{los_test['recall_macro']:.4f}")
     col4.metric("F1-Score", f"{los_test['f1_macro']:.4f}")
 
+    # --- Extended target results ---
+    extended_targets = {
+        'icu_readmit_48h': 'ICU Readmission (48h)',
+        'icu_readmit_7d': 'ICU Readmission (7d)',
+        'discharge_disposition': 'Discharge Disposition',
+        'need_vent_any': 'Mechanical Ventilation',
+        'need_vasopressor_any': 'Vasopressor Use',
+        'need_rrt_any': 'Renal Replacement',
+        'aki_onset': 'AKI Onset',
+        'ards_onset': 'ARDS Onset',
+        'liver_injury_onset': 'Liver Injury Onset',
+        'sepsis_onset': 'Sepsis Onset',
+    }
+    shown_any = False
+    for key, title in extended_targets.items():
+        if key in results:
+            if not shown_any:
+                st.markdown("---")
+                st.subheader("3. Extended Target Models")
+                shown_any = True
+            test_m = results[key].get('test', {})
+            cols = st.columns(5)
+            cols[0].markdown(f"**{title}**")
+            for i, (metric, label) in enumerate([
+                ('roc_auc', 'ROC-AUC'), ('accuracy', 'Acc'),
+                ('f1', 'F1'), ('f1_macro', 'F1-macro')
+            ]):
+                val = test_m.get(metric)
+                if val is not None:
+                    cols[i + 1].metric(label, f"{val:.4f}")
+
 def show_about():
     """Display about page."""
     st.header("About This Project")
@@ -339,26 +506,22 @@ def show_about():
     This machine learning system predicts patient outcomes in Intensive Care Units using the **MIMIC-IV v2.2 dataset**.
     
     ### Prediction Tasks
-    1. **Mortality Prediction** - Binary classification to predict in-hospital mortality risk
-    2. **Length of Stay Classification** - Multi-class prediction of ICU stay duration
+    1. **Mortality Prediction** — In-hospital mortality risk
+    2. **Length of Stay** — Classification (Short / Medium / Long) + continuous days
+    3. **ICU Readmission** — 48-hour and 7-day bounce-back risk
+    4. **Discharge Disposition** — Home / Facility / Death
+    5. **Organ Support** — Ventilation, Vasopressors, RRT need
+    6. **Disease Onset** — AKI, ARDS, Liver Injury, Sepsis
     
     ### Models Used
-    - **Logistic Regression** (Baseline)
-    - **Random Forest**
-    - **XGBoost** (Best performing)
+    - **Logistic Regression** (Baseline for mortality & LOS)
+    - **Random Forest** (Baseline for mortality & LOS)
+    - **XGBoost** (Primary model for all targets)
     
     ### Dataset
     - **Source:** MIMIC-IV v2.2 (Medical Information Mart for Intensive Care)
-    - **Size:** 73,181 ICU stays from 50,920 unique patients
-    - **Features:** 112 clinical features including:
-      - Demographic information (age, gender, ethnicity)
-      - Diagnosis codes (ICD-9/ICD-10)
-      - Procedure codes
-      - Temporal patterns
-    
-    ### Performance
-    - **Mortality Prediction:** 90.04% ROC-AUC
-    - **LOS Classification:** 74.56% Accuracy
+    - **Size:** ~73,000 ICU stays from ~51,000 unique patients
+    - **Features:** 100+ clinical features including demographics, diagnosis/procedure codes, lab values, and temporal patterns
     
     ### Technologies
     - Python 3.11

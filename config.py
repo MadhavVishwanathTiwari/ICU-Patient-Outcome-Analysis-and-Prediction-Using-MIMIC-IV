@@ -91,6 +91,36 @@ RANDOM_FOREST_PARAMS = {
 }
 
 # ============================================================================
+# CLINICAL ITEMID CONSTANTS (MIMIC-IV)
+# ============================================================================
+# Vasopressors (inputevents)
+VASOPRESSOR_ITEMIDS = [221906, 221289, 221662, 222315, 221749]
+
+# Ventilation (chartevents)
+VENT_ITEMIDS = [223848, 223849, 720]
+
+# Renal Replacement Therapy (procedureevents)
+RRT_ITEMIDS = [225802, 225803, 225805]
+
+# SOFA component labs (labevents)
+CREATININE_ITEMID = 50912
+PLATELETS_ITEMID  = 51265
+BILIRUBIN_ITEMID  = 50885
+PAO2_ITEMID       = 50821
+ALT_ITEMID        = 50861
+AST_ITEMID        = 50878
+
+# SOFA component vitals (chartevents)
+MAP_ITEMID  = 220052
+GCS_ITEMID  = 220739
+FIO2_ITEMID = 223835
+
+# Upper limits of normal for liver injury detection
+ULN_ALT = 40       # U/L
+ULN_AST = 40       # U/L
+ULN_BILIRUBIN = 1.2  # mg/dL
+
+# ============================================================================
 # DASHBOARD SETTINGS
 # ============================================================================
 DASHBOARD_TITLE = "ICU Patient Outcome Prediction Dashboard"
