@@ -24,9 +24,16 @@ from datetime import datetime
 import joblib
 import json
 import warnings
+import os  # <--- 1. ADD THIS
+
 warnings.filterwarnings('ignore')
 
+# 2. ADD THIS LINE (Forces joblib to skip the failing Windows subprocess command)
+os.environ['LOKY_MAX_CPU_COUNT'] = '4'
+
+
 # ML libraries
+from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
@@ -38,6 +45,7 @@ from sklearn.metrics import (
 )
 from imblearn.over_sampling import SMOTE
 import xgboost as xgb
+from catboost import CatBoostClassifier
 
 # Import configuration
 import sys
@@ -155,14 +163,21 @@ class ModelTrainer:
         
         print(f"     [OK] Features scaled")
         
-        # Handle class imbalance for mortality only (SMOTE used in _train_binary_xgb for others)
+        # Handle class imbalance for mortality
         if task == 'mortality' and HANDLE_IMBALANCE:
             print(f"\n  -> Handling class imbalance with SMOTE...")
-            smote = SMOTE(random_state=RANDOM_SEED)
+            
+            # Downcast to save RAM
+            X_train = X_train.astype(np.float32)
+            
+            # Force multi-threading using the NearestNeighbors object
+            knn = NearestNeighbors(n_jobs=-1)
+            smote = SMOTE(random_state=RANDOM_SEED, k_neighbors=knn)
+            
             X_train, y_train = smote.fit_resample(X_train, y_train)
             print(f"     [OK] Resampled training set: {len(X_train):,} samples")
             print(f"     New distribution: {pd.Series(y_train).value_counts().to_dict()}")
-        
+
         return X_train, X_val, X_test, y_train, y_val, y_test
     
     def train_mortality_models(self):
@@ -179,7 +194,7 @@ class ModelTrainer:
         results = {}
         
         # 1. Logistic Regression (Baseline)
-        print("\n[1/3] Training Logistic Regression...")
+        print("\n[1/4] Training Logistic Regression...")
         lr_model = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED, n_jobs=-1)
         lr_model.fit(X_train, y_train)
         
@@ -194,11 +209,10 @@ class ModelTrainer:
             'roc_auc': roc_auc_score(y_val, lr_proba)
         }
         self.models['mortality_lr'] = lr_model
-        
         print(f"   [OK] Logistic Regression - ROC-AUC: {results['logistic_regression']['roc_auc']:.4f}")
         
         # 2. Random Forest
-        print("\n[2/3] Training Random Forest...")
+        print("\n[2/4] Training Random Forest...")
         rf_model = RandomForestClassifier(**RANDOM_FOREST_PARAMS)
         rf_model.fit(X_train, y_train)
         
@@ -213,11 +227,10 @@ class ModelTrainer:
             'roc_auc': roc_auc_score(y_val, rf_proba)
         }
         self.models['mortality_rf'] = rf_model
-        
         print(f"   [OK] Random Forest - ROC-AUC: {results['random_forest']['roc_auc']:.4f}")
         
         # 3. XGBoost
-        print("\n[3/3] Training XGBoost...")
+        print("\n[3/4] Training XGBoost...")
         xgb_model = xgb.XGBClassifier(**XGBOOST_PARAMS, eval_metric='logloss')
         xgb_model.fit(X_train, y_train)
         
@@ -232,8 +245,26 @@ class ModelTrainer:
             'roc_auc': roc_auc_score(y_val, xgb_proba)
         }
         self.models['mortality_xgb'] = xgb_model
-        
         print(f"   [OK] XGBoost - ROC-AUC: {results['xgboost']['roc_auc']:.4f}")
+
+        # 4. CatBoost
+        print("\n[4/4] Training CatBoost...")
+        # CatBoost handles imbalance internally well, but we pass random_seed for reproducibility
+        cb_model = CatBoostClassifier(iterations=1000, random_seed=RANDOM_SEED, verbose=0, eval_metric='Logloss')
+        cb_model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=50)
+        
+        cb_pred = cb_model.predict(X_val)
+        cb_proba = cb_model.predict_proba(X_val)[:, 1]
+        
+        results['catboost'] = {
+            'accuracy': accuracy_score(y_val, cb_pred),
+            'precision': precision_score(y_val, cb_pred),
+            'recall': recall_score(y_val, cb_pred),
+            'f1': f1_score(y_val, cb_pred),
+            'roc_auc': roc_auc_score(y_val, cb_proba)
+        }
+        self.models['mortality_cb'] = cb_model
+        print(f"   [OK] CatBoost - ROC-AUC: {results['catboost']['roc_auc']:.4f}")
         
         # Find best model
         best_model_name = max(results, key=lambda k: results[k]['roc_auc'])
@@ -245,8 +276,10 @@ class ModelTrainer:
             best_model = lr_model
         elif best_model_name == 'random_forest':
             best_model = rf_model
-        else:
+        elif best_model_name == 'xgboost':
             best_model = xgb_model
+        else:
+            best_model = cb_model
         
         test_pred = best_model.predict(X_test)
         test_proba = best_model.predict_proba(X_test)[:, 1]
@@ -273,7 +306,7 @@ class ModelTrainer:
         }
         
         return results
-    
+
     def train_los_classification_models(self):
         """
         Train models for LOS category prediction (multi-class).
@@ -288,10 +321,9 @@ class ModelTrainer:
         results = {}
         
         # 1. Logistic Regression
-        print("\n[1/3] Training Logistic Regression...")
+        print("\n[1/4] Training Logistic Regression...")
         lr_model = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED, n_jobs=-1)
         lr_model.fit(X_train, y_train)
-        
         lr_pred = lr_model.predict(X_val)
         
         results['logistic_regression'] = {
@@ -301,14 +333,12 @@ class ModelTrainer:
             'f1_macro': f1_score(y_val, lr_pred, average='macro')
         }
         self.models['los_class_lr'] = lr_model
-        
         print(f"   [OK] Logistic Regression - Accuracy: {results['logistic_regression']['accuracy']:.4f}")
         
         # 2. Random Forest
-        print("\n[2/3] Training Random Forest...")
+        print("\n[2/4] Training Random Forest...")
         rf_model = RandomForestClassifier(**RANDOM_FOREST_PARAMS)
         rf_model.fit(X_train, y_train)
-        
         rf_pred = rf_model.predict(X_val)
         
         results['random_forest'] = {
@@ -318,14 +348,12 @@ class ModelTrainer:
             'f1_macro': f1_score(y_val, rf_pred, average='macro')
         }
         self.models['los_class_rf'] = rf_model
-        
         print(f"   [OK] Random Forest - Accuracy: {results['random_forest']['accuracy']:.4f}")
         
         # 3. XGBoost
-        print("\n[3/3] Training XGBoost...")
+        print("\n[3/4] Training XGBoost...")
         xgb_model = xgb.XGBClassifier(**XGBOOST_PARAMS, eval_metric='mlogloss')
         xgb_model.fit(X_train, y_train)
-        
         xgb_pred = xgb_model.predict(X_val)
         
         results['xgboost'] = {
@@ -335,8 +363,24 @@ class ModelTrainer:
             'f1_macro': f1_score(y_val, xgb_pred, average='macro')
         }
         self.models['los_class_xgb'] = xgb_model
-        
         print(f"   [OK] XGBoost - Accuracy: {results['xgboost']['accuracy']:.4f}")
+
+        # 4. CatBoost
+        print("\n[4/4] Training CatBoost...")
+        cb_model = CatBoostClassifier(iterations=1000, random_seed=RANDOM_SEED, loss_function='MultiClass', verbose=0)
+        cb_model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=50)
+        
+        # CatBoost sometimes returns nested arrays for multi-class predictions, flatten them
+        cb_pred = cb_model.predict(X_val).flatten() 
+        
+        results['catboost'] = {
+            'accuracy': accuracy_score(y_val, cb_pred),
+            'precision_macro': precision_score(y_val, cb_pred, average='macro'),
+            'recall_macro': recall_score(y_val, cb_pred, average='macro'),
+            'f1_macro': f1_score(y_val, cb_pred, average='macro')
+        }
+        self.models['los_class_cb'] = cb_model
+        print(f"   [OK] CatBoost - Accuracy: {results['catboost']['accuracy']:.4f}")
         
         # Find best model
         best_model_name = max(results, key=lambda k: results[k]['accuracy'])
@@ -347,10 +391,12 @@ class ModelTrainer:
             best_model = lr_model
         elif best_model_name == 'random_forest':
             best_model = rf_model
-        else:
+        elif best_model_name == 'xgboost':
             best_model = xgb_model
+        else:
+            best_model = cb_model
         
-        test_pred = best_model.predict(X_test)
+        test_pred = best_model.predict(X_test).flatten() if best_model_name == 'catboost' else best_model.predict(X_test)
         
         test_results = {
             'accuracy': accuracy_score(y_test, test_pred),
@@ -372,7 +418,7 @@ class ModelTrainer:
         }
         
         return results
-    
+        
     # ------------------------------------------------------------------
     # Generic binary XGBoost trainer (reused for new targets)
     # ------------------------------------------------------------------
@@ -413,7 +459,14 @@ class ModelTrainer:
                      and target_col not in self.SMOTE_SKIP_TARGETS)
         if use_smote:
             print(f"  -> Positive rate {pos_rate*100:.1f}% - applying SMOTE + scale_pos_weight={spw}")
-            smote = SMOTE(random_state=RANDOM_SEED)
+            
+            # Downcast to save RAM
+            X_train = X_train.astype(np.float32)
+            
+            # Force multi-threading
+            knn = NearestNeighbors(n_jobs=-1)
+            smote = SMOTE(random_state=RANDOM_SEED, k_neighbors=knn)
+            
             X_train, y_train = smote.fit_resample(X_train, y_train)
             n_neg = int((y_train == 0).sum())
             n_pos = int((y_train == 1).sum())

@@ -87,7 +87,7 @@ RANDOM_FOREST_PARAMS = {
     'min_samples_split': 5,
     'min_samples_leaf': 2,
     'random_state': RANDOM_SEED,
-    'n_jobs': -1
+    'n_jobs': 2
 }
 
 # ============================================================================
