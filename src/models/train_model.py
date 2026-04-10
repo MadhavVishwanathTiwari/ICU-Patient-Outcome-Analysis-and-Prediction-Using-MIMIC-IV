@@ -41,11 +41,16 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, classification_report, confusion_matrix,
-    mean_squared_error, mean_absolute_error, r2_score
+    mean_squared_error, mean_absolute_error, r2_score,
+    roc_curve, auc
 )
+from sklearn.preprocessing import label_binarize
 from imblearn.over_sampling import SMOTE
 import xgboost as xgb
 from catboost import CatBoostClassifier
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # Import configuration
 import sys
@@ -184,240 +189,15 @@ class ModelTrainer:
         """
         Train models for mortality prediction.
         """
-        print("\n" + "=" * 70)
-        print("TRAINING MORTALITY PREDICTION MODELS")
-        print("=" * 70)
-        
-        # Prepare data
-        X_train, X_val, X_test, y_train, y_val, y_test = self.prepare_data(task='mortality')
-        
-        results = {}
-        
-        # 1. Logistic Regression (Baseline)
-        print("\n[1/4] Training Logistic Regression...")
-        lr_model = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED, n_jobs=-1)
-        lr_model.fit(X_train, y_train)
-        
-        lr_pred = lr_model.predict(X_val)
-        lr_proba = lr_model.predict_proba(X_val)[:, 1]
-        
-        results['logistic_regression'] = {
-            'accuracy': accuracy_score(y_val, lr_pred),
-            'precision': precision_score(y_val, lr_pred),
-            'recall': recall_score(y_val, lr_pred),
-            'f1': f1_score(y_val, lr_pred),
-            'roc_auc': roc_auc_score(y_val, lr_proba)
-        }
-        self.models['mortality_lr'] = lr_model
-        print(f"   [OK] Logistic Regression - ROC-AUC: {results['logistic_regression']['roc_auc']:.4f}")
-        
-        # 2. Random Forest
-        print("\n[2/4] Training Random Forest...")
-        rf_model = RandomForestClassifier(**RANDOM_FOREST_PARAMS)
-        rf_model.fit(X_train, y_train)
-        
-        rf_pred = rf_model.predict(X_val)
-        rf_proba = rf_model.predict_proba(X_val)[:, 1]
-        
-        results['random_forest'] = {
-            'accuracy': accuracy_score(y_val, rf_pred),
-            'precision': precision_score(y_val, rf_pred),
-            'recall': recall_score(y_val, rf_pred),
-            'f1': f1_score(y_val, rf_pred),
-            'roc_auc': roc_auc_score(y_val, rf_proba)
-        }
-        self.models['mortality_rf'] = rf_model
-        print(f"   [OK] Random Forest - ROC-AUC: {results['random_forest']['roc_auc']:.4f}")
-        
-        # 3. XGBoost
-        print("\n[3/4] Training XGBoost...")
-        xgb_model = xgb.XGBClassifier(**XGBOOST_PARAMS, eval_metric='logloss')
-        xgb_model.fit(X_train, y_train)
-        
-        xgb_pred = xgb_model.predict(X_val)
-        xgb_proba = xgb_model.predict_proba(X_val)[:, 1]
-        
-        results['xgboost'] = {
-            'accuracy': accuracy_score(y_val, xgb_pred),
-            'precision': precision_score(y_val, xgb_pred),
-            'recall': recall_score(y_val, xgb_pred),
-            'f1': f1_score(y_val, xgb_pred),
-            'roc_auc': roc_auc_score(y_val, xgb_proba)
-        }
-        self.models['mortality_xgb'] = xgb_model
-        print(f"   [OK] XGBoost - ROC-AUC: {results['xgboost']['roc_auc']:.4f}")
-
-        # 4. CatBoost
-        print("\n[4/4] Training CatBoost...")
-        # CatBoost handles imbalance internally well, but we pass random_seed for reproducibility
-        cb_model = CatBoostClassifier(iterations=1000, random_seed=RANDOM_SEED, verbose=0, eval_metric='Logloss')
-        cb_model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=50)
-        
-        cb_pred = cb_model.predict(X_val)
-        cb_proba = cb_model.predict_proba(X_val)[:, 1]
-        
-        results['catboost'] = {
-            'accuracy': accuracy_score(y_val, cb_pred),
-            'precision': precision_score(y_val, cb_pred),
-            'recall': recall_score(y_val, cb_pred),
-            'f1': f1_score(y_val, cb_pred),
-            'roc_auc': roc_auc_score(y_val, cb_proba)
-        }
-        self.models['mortality_cb'] = cb_model
-        print(f"   [OK] CatBoost - ROC-AUC: {results['catboost']['roc_auc']:.4f}")
-        
-        # Find best model
-        best_model_name = max(results, key=lambda k: results[k]['roc_auc'])
-        print(f"\n  [BEST MODEL] {best_model_name.upper()} with ROC-AUC: {results[best_model_name]['roc_auc']:.4f}")
-        
-        # Evaluate best model on test set
-        print(f"\n  -> Evaluating best model on test set...")
-        if best_model_name == 'logistic_regression':
-            best_model = lr_model
-        elif best_model_name == 'random_forest':
-            best_model = rf_model
-        elif best_model_name == 'xgboost':
-            best_model = xgb_model
-        else:
-            best_model = cb_model
-        
-        test_pred = best_model.predict(X_test)
-        test_proba = best_model.predict_proba(X_test)[:, 1]
-        
-        test_results = {
-            'accuracy': accuracy_score(y_test, test_pred),
-            'precision': precision_score(y_test, test_pred),
-            'recall': recall_score(y_test, test_pred),
-            'f1': f1_score(y_test, test_pred),
-            'roc_auc': roc_auc_score(y_test, test_proba)
-        }
-        
-        print(f"     [TEST SET RESULTS]")
-        print(f"     Accuracy:  {test_results['accuracy']:.4f}")
-        print(f"     Precision: {test_results['precision']:.4f}")
-        print(f"     Recall:    {test_results['recall']:.4f}")
-        print(f"     F1-Score:  {test_results['f1']:.4f}")
-        print(f"     ROC-AUC:   {test_results['roc_auc']:.4f}")
-        
-        self.results['mortality'] = {
-            'validation': results,
-            'test': test_results,
-            'best_model': best_model_name
-        }
-        
-        return results
+        self._train_binary_models('Mortality Prediction', 'mortality', 'mortality')
+        return self.results.get('mortality', {})
 
     def train_los_classification_models(self):
         """
         Train models for LOS category prediction (multi-class).
         """
-        print("\n" + "=" * 70)
-        print("TRAINING LENGTH OF STAY CLASSIFICATION MODELS")
-        print("=" * 70)
-        
-        # Prepare data
-        X_train, X_val, X_test, y_train, y_val, y_test = self.prepare_data(task='los_category')
-        
-        results = {}
-        
-        # 1. Logistic Regression
-        print("\n[1/4] Training Logistic Regression...")
-        lr_model = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED, n_jobs=-1)
-        lr_model.fit(X_train, y_train)
-        lr_pred = lr_model.predict(X_val)
-        
-        results['logistic_regression'] = {
-            'accuracy': accuracy_score(y_val, lr_pred),
-            'precision_macro': precision_score(y_val, lr_pred, average='macro'),
-            'recall_macro': recall_score(y_val, lr_pred, average='macro'),
-            'f1_macro': f1_score(y_val, lr_pred, average='macro')
-        }
-        self.models['los_class_lr'] = lr_model
-        print(f"   [OK] Logistic Regression - Accuracy: {results['logistic_regression']['accuracy']:.4f}")
-        
-        # 2. Random Forest
-        print("\n[2/4] Training Random Forest...")
-        rf_model = RandomForestClassifier(**RANDOM_FOREST_PARAMS)
-        rf_model.fit(X_train, y_train)
-        rf_pred = rf_model.predict(X_val)
-        
-        results['random_forest'] = {
-            'accuracy': accuracy_score(y_val, rf_pred),
-            'precision_macro': precision_score(y_val, rf_pred, average='macro'),
-            'recall_macro': recall_score(y_val, rf_pred, average='macro'),
-            'f1_macro': f1_score(y_val, rf_pred, average='macro')
-        }
-        self.models['los_class_rf'] = rf_model
-        print(f"   [OK] Random Forest - Accuracy: {results['random_forest']['accuracy']:.4f}")
-        
-        # 3. XGBoost
-        print("\n[3/4] Training XGBoost...")
-        xgb_model = xgb.XGBClassifier(**XGBOOST_PARAMS, eval_metric='mlogloss')
-        xgb_model.fit(X_train, y_train)
-        xgb_pred = xgb_model.predict(X_val)
-        
-        results['xgboost'] = {
-            'accuracy': accuracy_score(y_val, xgb_pred),
-            'precision_macro': precision_score(y_val, xgb_pred, average='macro'),
-            'recall_macro': recall_score(y_val, xgb_pred, average='macro'),
-            'f1_macro': f1_score(y_val, xgb_pred, average='macro')
-        }
-        self.models['los_class_xgb'] = xgb_model
-        print(f"   [OK] XGBoost - Accuracy: {results['xgboost']['accuracy']:.4f}")
-
-        # 4. CatBoost
-        print("\n[4/4] Training CatBoost...")
-        cb_model = CatBoostClassifier(iterations=1000, random_seed=RANDOM_SEED, loss_function='MultiClass', verbose=0)
-        cb_model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=50)
-        
-        # CatBoost sometimes returns nested arrays for multi-class predictions, flatten them
-        cb_pred = cb_model.predict(X_val).flatten() 
-        
-        results['catboost'] = {
-            'accuracy': accuracy_score(y_val, cb_pred),
-            'precision_macro': precision_score(y_val, cb_pred, average='macro'),
-            'recall_macro': recall_score(y_val, cb_pred, average='macro'),
-            'f1_macro': f1_score(y_val, cb_pred, average='macro')
-        }
-        self.models['los_class_cb'] = cb_model
-        print(f"   [OK] CatBoost - Accuracy: {results['catboost']['accuracy']:.4f}")
-        
-        # Find best model
-        best_model_name = max(results, key=lambda k: results[k]['accuracy'])
-        print(f"\n  [BEST MODEL] {best_model_name.upper()} with Accuracy: {results[best_model_name]['accuracy']:.4f}")
-        
-        # Evaluate on test set
-        if best_model_name == 'logistic_regression':
-            best_model = lr_model
-        elif best_model_name == 'random_forest':
-            best_model = rf_model
-        elif best_model_name == 'xgboost':
-            best_model = xgb_model
-        else:
-            best_model = cb_model
-        
-        test_pred = best_model.predict(X_test).flatten() if best_model_name == 'catboost' else best_model.predict(X_test)
-        
-        test_results = {
-            'accuracy': accuracy_score(y_test, test_pred),
-            'precision_macro': precision_score(y_test, test_pred, average='macro'),
-            'recall_macro': recall_score(y_test, test_pred, average='macro'),
-            'f1_macro': f1_score(y_test, test_pred, average='macro')
-        }
-        
-        print(f"\n     [TEST SET RESULTS]")
-        print(f"     Accuracy:  {test_results['accuracy']:.4f}")
-        print(f"     Precision: {test_results['precision_macro']:.4f}")
-        print(f"     Recall:    {test_results['recall_macro']:.4f}")
-        print(f"     F1-Score:  {test_results['f1_macro']:.4f}")
-        
-        self.results['los_classification'] = {
-            'validation': results,
-            'test': test_results,
-            'best_model': best_model_name
-        }
-        
-        return results
+        self._train_multiclass_models('LOS Category Prediction', 'los_category', 'los_class')
+        return self.results.get('los_category', {})
         
     # ------------------------------------------------------------------
     # Generic binary XGBoost trainer (reused for new targets)
@@ -425,6 +205,218 @@ class ModelTrainer:
 
     # Targets where SMOTE hurts (insufficient temporal signal; oversampling adds noise)
     SMOTE_SKIP_TARGETS = {'icu_readmit_48h', 'icu_readmit_7d'}
+
+    def _get_model_dict(self, problem_type='binary', scale_pos_weight=1.0):
+        """Return model dictionary for binary or multiclass classification."""
+        if problem_type == 'binary':
+            return {
+                'logistic_regression': LogisticRegression(
+                    max_iter=1000, random_state=RANDOM_SEED, n_jobs=-1, class_weight='balanced'
+                ),
+                'random_forest': RandomForestClassifier(
+                    **RANDOM_FOREST_PARAMS, class_weight='balanced'
+                ),
+                'xgboost': xgb.XGBClassifier(
+                    **XGBOOST_PARAMS, eval_metric='logloss', scale_pos_weight=scale_pos_weight
+                ),
+                'catboost': CatBoostClassifier(
+                    iterations=1000, random_seed=RANDOM_SEED, verbose=0,
+                    eval_metric='Logloss', auto_class_weights='Balanced'
+                )
+            }
+        return {
+            'logistic_regression': LogisticRegression(
+                max_iter=1000, random_state=RANDOM_SEED, n_jobs=-1
+            ),
+            'random_forest': RandomForestClassifier(**RANDOM_FOREST_PARAMS),
+            'xgboost': xgb.XGBClassifier(**XGBOOST_PARAMS, eval_metric='mlogloss'),
+            'catboost': CatBoostClassifier(
+                iterations=1000, random_seed=RANDOM_SEED, loss_function='MultiClass', verbose=0
+            )
+        }
+
+    def _save_binary_roc_plot(self, task_name, y_true, proba_map, output_dir='reports/figures/roc'):
+        """Save ROC comparison plot for binary tasks."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        plt.figure(figsize=(8, 6))
+        for model_name, probs in proba_map.items():
+            fpr, tpr, _ = roc_curve(y_true, probs)
+            model_auc = auc(fpr, tpr)
+            plt.plot(fpr, tpr, lw=2, label=f'{model_name} (AUC={model_auc:.3f})')
+        plt.plot([0, 1], [0, 1], linestyle='--', lw=1, color='gray', label='Chance')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'ROC Curve Comparison - {task_name}')
+        plt.legend(loc='lower right')
+        plt.tight_layout()
+        out_path = output_dir / f'{task_name}_roc_comparison.png'
+        plt.savefig(out_path, dpi=180)
+        plt.close()
+        print(f"  [OK] Saved ROC plot: {out_path}")
+
+    def _save_multiclass_roc_plot(self, task_name, y_true, proba_map, output_dir='reports/figures/roc'):
+        """Save one-vs-rest micro-average ROC comparison plot for multiclass tasks."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        classes = np.unique(y_true)
+        y_bin = label_binarize(y_true, classes=classes)
+
+        plt.figure(figsize=(8, 6))
+        for model_name, probs in proba_map.items():
+            fpr, tpr, _ = roc_curve(y_bin.ravel(), probs.ravel())
+            model_auc = auc(fpr, tpr)
+            plt.plot(fpr, tpr, lw=2, label=f'{model_name} (micro-AUC={model_auc:.3f})')
+        plt.plot([0, 1], [0, 1], linestyle='--', lw=1, color='gray', label='Chance')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'Multiclass ROC (One-vs-Rest) - {task_name}')
+        plt.legend(loc='lower right')
+        plt.tight_layout()
+        out_path = output_dir / f'{task_name}_roc_comparison.png'
+        plt.savefig(out_path, dpi=180)
+        plt.close()
+        print(f"  [OK] Saved ROC plot: {out_path}")
+
+    def _train_binary_models(self, task_name: str, target_col: str, model_prefix: str):
+        """Train LR/RF/XGB/CatBoost models for a binary target."""
+        if target_col not in self.data.columns:
+            print(f"  [SKIP] {target_col} not in data")
+            return
+        if self.data[target_col].nunique() < 2:
+            print(f"  [SKIP] {target_col} has only one class")
+            return
+
+        print(f"\n{'=' * 70}")
+        print(f"TRAINING: {task_name}")
+        print(f"{'=' * 70}")
+
+        X_train, X_val, X_test, y_train, y_val, y_test = self.prepare_data(task=target_col)
+
+        n_neg = int((y_train == 0).sum())
+        n_pos = int((y_train == 1).sum())
+        spw = round(n_neg / n_pos, 2) if n_pos > 0 else 1.0
+        pos_rate = n_pos / (n_neg + n_pos)
+
+        use_smote = (pos_rate < 0.10 and HANDLE_IMBALANCE and target_col not in self.SMOTE_SKIP_TARGETS)
+        if use_smote:
+            print(f"  -> Positive rate {pos_rate*100:.1f}% - applying SMOTE + scale_pos_weight={spw}")
+            X_train = X_train.astype(np.float32)
+            knn = NearestNeighbors(n_jobs=-1)
+            smote = SMOTE(random_state=RANDOM_SEED, k_neighbors=knn)
+            X_train, y_train = smote.fit_resample(X_train, y_train)
+            n_neg = int((y_train == 0).sum())
+            n_pos = int((y_train == 1).sum())
+            spw = round(n_neg / n_pos, 2) if n_pos > 0 else 1.0
+            print(f"     [OK] After SMOTE: {len(X_train):,} samples, spw={spw}")
+        else:
+            print(f"  -> scale_pos_weight={spw}")
+
+        models = self._get_model_dict(problem_type='binary', scale_pos_weight=spw)
+        val_results = {}
+        test_results = {}
+        val_proba_map = {}
+
+        for i, (model_name, model) in enumerate(models.items(), 1):
+            print(f"\n[{i}/4] Training {model_name}...")
+            if model_name == 'catboost':
+                model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=50)
+            else:
+                model.fit(X_train, y_train)
+
+            val_pred = model.predict(X_val)
+            val_proba = model.predict_proba(X_val)[:, 1]
+            val_proba_map[model_name] = val_proba
+            val_results[model_name] = {
+                'accuracy': float(accuracy_score(y_val, val_pred)),
+                'precision': float(precision_score(y_val, val_pred, zero_division=0)),
+                'recall': float(recall_score(y_val, val_pred, zero_division=0)),
+                'f1': float(f1_score(y_val, val_pred, zero_division=0)),
+                'roc_auc': float(roc_auc_score(y_val, val_proba))
+            }
+
+            test_pred = model.predict(X_test)
+            test_proba = model.predict_proba(X_test)[:, 1]
+            test_results[model_name] = {
+                'accuracy': float(accuracy_score(y_test, test_pred)),
+                'precision': float(precision_score(y_test, test_pred, zero_division=0)),
+                'recall': float(recall_score(y_test, test_pred, zero_division=0)),
+                'f1': float(f1_score(y_test, test_pred, zero_division=0)),
+                'roc_auc': float(roc_auc_score(y_test, test_proba))
+            }
+
+            model_key = f'{model_prefix}_{model_name}'
+            self.models[model_key] = model
+            print(f"   [OK] {model_name} - VAL ROC-AUC: {val_results[model_name]['roc_auc']:.4f}")
+
+        self._save_binary_roc_plot(task_name=target_col, y_true=y_val, proba_map=val_proba_map)
+        best_model_name = max(val_results, key=lambda k: val_results[k]['roc_auc'])
+        self.results[target_col] = {
+            'validation': val_results,
+            'test': test_results[best_model_name],
+            'best_model': best_model_name
+        }
+        print(f"\n  [BEST MODEL] {best_model_name.upper()} with ROC-AUC: {val_results[best_model_name]['roc_auc']:.4f}")
+
+    def _train_multiclass_models(self, task_name: str, target_col: str, model_prefix: str):
+        """Train LR/RF/XGB/CatBoost models for a multiclass target."""
+        if target_col not in self.data.columns:
+            print(f"  [SKIP] {target_col} not in data")
+            return
+
+        print(f"\n{'=' * 70}")
+        print(f"TRAINING: {task_name}")
+        print(f"{'=' * 70}")
+
+        X_train, X_val, X_test, y_train, y_val, y_test = self.prepare_data(task=target_col)
+        models = self._get_model_dict(problem_type='multiclass')
+        val_results = {}
+        test_results = {}
+        val_proba_map = {}
+        classes = np.unique(y_train)
+
+        for i, (model_name, model) in enumerate(models.items(), 1):
+            print(f"\n[{i}/4] Training {model_name}...")
+            if model_name == 'catboost':
+                model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=50)
+                val_pred = model.predict(X_val).flatten()
+                test_pred = model.predict(X_test).flatten()
+            else:
+                model.fit(X_train, y_train)
+                val_pred = model.predict(X_val)
+                test_pred = model.predict(X_test)
+
+            val_proba = model.predict_proba(X_val)
+            test_proba = model.predict_proba(X_test)
+            val_proba_map[model_name] = val_proba
+
+            val_results[model_name] = {
+                'accuracy': float(accuracy_score(y_val, val_pred)),
+                'precision_macro': float(precision_score(y_val, val_pred, average='macro', zero_division=0)),
+                'recall_macro': float(recall_score(y_val, val_pred, average='macro', zero_division=0)),
+                'f1_macro': float(f1_score(y_val, val_pred, average='macro', zero_division=0)),
+                'roc_auc_ovr_macro': float(roc_auc_score(y_val, val_proba, multi_class='ovr', average='macro', labels=classes))
+            }
+            test_results[model_name] = {
+                'accuracy': float(accuracy_score(y_test, test_pred)),
+                'precision_macro': float(precision_score(y_test, test_pred, average='macro', zero_division=0)),
+                'recall_macro': float(recall_score(y_test, test_pred, average='macro', zero_division=0)),
+                'f1_macro': float(f1_score(y_test, test_pred, average='macro', zero_division=0)),
+                'roc_auc_ovr_macro': float(roc_auc_score(y_test, test_proba, multi_class='ovr', average='macro', labels=classes))
+            }
+            self.models[f'{model_prefix}_{model_name}'] = model
+            print(f"   [OK] {model_name} - VAL ROC-AUC(OVR-macro): {val_results[model_name]['roc_auc_ovr_macro']:.4f}")
+
+        self._save_multiclass_roc_plot(task_name=target_col, y_true=y_val, proba_map=val_proba_map)
+        best_model_name = max(val_results, key=lambda k: val_results[k]['roc_auc_ovr_macro'])
+        self.results[target_col] = {
+            'validation': val_results,
+            'test': test_results[best_model_name],
+            'best_model': best_model_name
+        }
+        print(f"\n  [BEST MODEL] {best_model_name.upper()} with ROC-AUC(OVR-macro): {val_results[best_model_name]['roc_auc_ovr_macro']:.4f}")
 
     def _train_binary_xgb(self, task_name: str, target_col: str):
         """Train a single XGBoost binary classifier for *target_col*.
@@ -514,51 +506,24 @@ class ModelTrainer:
         }
 
     def train_readmission_models(self):
-        self._train_binary_xgb('ICU Readmission 48h', 'icu_readmit_48h')
-        self._train_binary_xgb('ICU Readmission 7d', 'icu_readmit_7d')
+        self._train_binary_models('ICU Readmission 48h', 'icu_readmit_48h', 'icu_readmit_48h')
+        self._train_binary_models('ICU Readmission 7d', 'icu_readmit_7d', 'icu_readmit_7d')
 
     def train_discharge_disposition_model(self):
-        """3-class XGBoost for discharge disposition."""
-        target = 'discharge_disposition'
-        if target not in self.data.columns:
-            return
-        print(f"\n{'=' * 70}")
-        print("TRAINING: Discharge Disposition (3-class)")
-        print(f"{'=' * 70}")
-
-        X_train, X_val, X_test, y_train, y_val, y_test = self.prepare_data(task=target)
-        model = xgb.XGBClassifier(**XGBOOST_PARAMS, eval_metric='mlogloss',
-                                   num_class=3, objective='multi:softprob')
-        model.fit(X_train, y_train)
-
-        val_pred = model.predict(X_val)
-        val_metrics = {
-            'accuracy': float(accuracy_score(y_val, val_pred)),
-            'f1_macro': float(f1_score(y_val, val_pred, average='macro', zero_division=0))
-        }
-        test_pred = model.predict(X_test)
-        test_metrics = {
-            'accuracy': float(accuracy_score(y_test, test_pred)),
-            'f1_macro': float(f1_score(y_test, test_pred, average='macro', zero_division=0))
-        }
-        print(f"  [VAL]  Accuracy: {val_metrics['accuracy']:.4f}  F1-macro: {val_metrics['f1_macro']:.4f}")
-        print(f"  [TEST] Accuracy: {test_metrics['accuracy']:.4f}  F1-macro: {test_metrics['f1_macro']:.4f}")
-
-        self.models['discharge_disposition_xgb'] = model
-        self.results['discharge_disposition'] = {
-            'validation': val_metrics, 'test': test_metrics, 'best_model': 'xgboost'
-        }
+        self._train_multiclass_models(
+            'Discharge Disposition (3-class)', 'discharge_disposition', 'discharge_disposition'
+        )
 
     def train_organ_support_models(self):
-        self._train_binary_xgb('Ventilation Need', 'need_vent_any')
-        self._train_binary_xgb('Vasopressor Need', 'need_vasopressor_any')
-        self._train_binary_xgb('RRT Need', 'need_rrt_any')
+        self._train_binary_models('Ventilation Need', 'need_vent_any', 'need_vent_any')
+        self._train_binary_models('Vasopressor Need', 'need_vasopressor_any', 'need_vasopressor_any')
+        self._train_binary_models('RRT Need', 'need_rrt_any', 'need_rrt_any')
 
     def train_disease_onset_models(self):
-        self._train_binary_xgb('AKI Onset', 'aki_onset')
-        self._train_binary_xgb('ARDS Onset', 'ards_onset')
-        self._train_binary_xgb('Liver Injury Onset', 'liver_injury_onset')
-        self._train_binary_xgb('Sepsis Onset', 'sepsis_onset')
+        self._train_binary_models('AKI Onset', 'aki_onset', 'aki_onset')
+        self._train_binary_models('ARDS Onset', 'ards_onset', 'ards_onset')
+        self._train_binary_models('Liver Injury Onset', 'liver_injury_onset', 'liver_injury_onset')
+        self._train_binary_models('Sepsis Onset', 'sepsis_onset', 'sepsis_onset')
 
     # ------------------------------------------------------------------
 

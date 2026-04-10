@@ -31,42 +31,68 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# ── Model prefix mapping ──────────────────────────────────────────────────────
+# Maps results.json key  →  filename prefix used when saving the model
+TASK_PREFIX = {
+    'mortality':              'mortality',
+    'los_category':           'los_class',
+    'icu_readmit_48h':        'icu_readmit_48h',
+    'icu_readmit_7d':         'icu_readmit_7d',
+    'discharge_disposition':  'discharge_disposition',
+    'need_vent_any':          'need_vent_any',
+    'need_vasopressor_any':   'need_vasopressor_any',
+    'need_rrt_any':           'need_rrt_any',
+    'aki_onset':              'aki_onset',
+    'ards_onset':             'ards_onset',
+    'liver_injury_onset':     'liver_injury_onset',
+    'sepsis_onset':           'sepsis_onset',
+}
+
 # Load models and data
 @st.cache_resource
 def load_models():
-    """Load trained models and scaler."""
+    """
+    Load the best-performing trained model for every task.
+
+    Strategy
+    --------
+    1. Read results.json to find which model won each task (best_model field).
+    2. Construct the filename from the task prefix + best_model name and load it.
+    3. Fall back gracefully if a file is missing.
+
+    Returns
+    -------
+    models : dict
+        Keys are task names (e.g. 'mortality'), values are loaded estimators.
+        Also includes 'scaler'.
+    results : dict
+        Raw contents of results.json.
+    """
     models_dir = Path('models')
-
-    required = {
-        'mortality_xgb': 'mortality_xgb.pkl',
-        'los_class_xgb': 'los_class_xgb.pkl',
-        'scaler': 'scaler.pkl',
-    }
-    optional = {
-        'icu_readmit_48h_xgb': 'icu_readmit_48h_xgb.pkl',
-        'icu_readmit_7d_xgb': 'icu_readmit_7d_xgb.pkl',
-        'discharge_disposition_xgb': 'discharge_disposition_xgb.pkl',
-        'need_vent_any_xgb': 'need_vent_any_xgb.pkl',
-        'need_vasopressor_any_xgb': 'need_vasopressor_any_xgb.pkl',
-        'need_rrt_any_xgb': 'need_rrt_any_xgb.pkl',
-        'aki_onset_xgb': 'aki_onset_xgb.pkl',
-        'ards_onset_xgb': 'ards_onset_xgb.pkl',
-        'liver_injury_onset_xgb': 'liver_injury_onset_xgb.pkl',
-        'sepsis_onset_xgb': 'sepsis_onset_xgb.pkl',
-    }
-
-    models = {}
-    for key, fname in required.items():
-        models[key] = joblib.load(models_dir / fname)
-    for key, fname in optional.items():
-        path = models_dir / fname
-        if path.exists():
-            models[key] = joblib.load(path)
 
     with open(models_dir / 'results.json', 'r') as f:
         results = json.load(f)
 
+    models = {}
+
+    # Scaler is always needed
+    models['scaler'] = joblib.load(models_dir / 'scaler.pkl')
+
+    for task_key, prefix in TASK_PREFIX.items():
+        if task_key not in results:
+            continue  # task wasn't trained
+
+        best_model_name = results[task_key]['best_model']           # e.g. 'catboost'
+        fname = f'{prefix}_{best_model_name}.pkl'                   # e.g. 'mortality_catboost.pkl'
+        path  = models_dir / fname
+
+        if path.exists():
+            models[task_key] = joblib.load(path)
+        else:
+            st.warning(f"Best model file not found for '{task_key}': {fname}")
+
     return models, results
+
 
 @st.cache_data
 def load_data():
@@ -106,7 +132,7 @@ def main():
     if page == "📊 Dashboard":
         show_dashboard(data, results)
     elif page == "🔮 Predictions":
-        show_predictions(models, data)
+        show_predictions(models, data, results)
     elif page == "📈 Model Performance":
         show_model_performance(results)
     else:
@@ -180,10 +206,31 @@ def show_dashboard(data, results):
     fig.update_layout(xaxis_title="Age (years)", yaxis_title="Frequency")
     st.plotly_chart(fig, use_container_width=True)
 
-def show_predictions(models, data):
+def show_predictions(models, data, results):
     """Interactive prediction interface."""
     st.header("Patient Outcome Predictions")
-    
+
+    # Show which model is being used for each task
+    with st.expander("ℹ️ Models in use (best by validation ROC-AUC)"):
+        rows = []
+        for task_key in TASK_PREFIX:
+            if task_key in results and task_key in models:
+                best = results[task_key]['best_model'].replace('_', ' ').title()
+                val_auc = (
+                    results[task_key]['validation']
+                    .get(results[task_key]['best_model'], {})
+                    .get('roc_auc') or
+                    results[task_key]['validation']
+                    .get(results[task_key]['best_model'], {})
+                    .get('roc_auc_ovr_macro')
+                )
+                rows.append({
+                    'Task': task_key.replace('_', ' ').title(),
+                    'Best Model': best,
+                    'Val ROC-AUC': f"{val_auc:.4f}" if val_auc else 'N/A'
+                })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
     st.markdown("""
     Enter patient information to predict:
     - **Mortality risk** (probability of in-hospital death)
@@ -231,7 +278,7 @@ def show_predictions(models, data):
     
     with col1:
         st.markdown("### Mortality Risk")
-        mortality_prob = models['mortality_xgb'].predict_proba(X_scaled)[0][1]
+        mortality_prob = models['mortality'].predict_proba(X_scaled)[0][1]
         
         # Gauge chart
         fig = go.Figure(go.Indicator(
@@ -263,8 +310,8 @@ def show_predictions(models, data):
     
     with col2:
         st.markdown("### Length of Stay Prediction")
-        los_pred = models['los_class_xgb'].predict(X_scaled)[0]
-        los_proba = models['los_class_xgb'].predict_proba(X_scaled)[0]
+        los_pred = models['los_category'].predict(X_scaled)[0]
+        los_proba = models['los_category'].predict_proba(X_scaled)[0]
         
         los_labels = ['Short (<3d)', 'Medium (3-7d)', 'Long (>7d)']
         predicted_category = los_labels[los_pred]
@@ -292,8 +339,8 @@ def show_predictions(models, data):
     st.subheader("ICU Readmission Risk")
     rc1, rc2 = st.columns(2)
     for col_ui, key, label in [
-        (rc1, 'icu_readmit_48h_xgb', '48-Hour'),
-        (rc2, 'icu_readmit_7d_xgb', '7-Day')
+        (rc1, 'icu_readmit_48h', '48-Hour'),
+        (rc2, 'icu_readmit_7d', '7-Day')
     ]:
         with col_ui:
             if key in models:
@@ -311,10 +358,10 @@ def show_predictions(models, data):
                 st.info(f"{label} readmission model not trained yet.")
 
     # -------- Discharge Disposition --------
-    if 'discharge_disposition_xgb' in models:
+    if 'discharge_disposition' in models:
         st.markdown("---")
         st.subheader("Discharge Disposition Prediction")
-        dd_proba = models['discharge_disposition_xgb'].predict_proba(X_scaled)[0]
+        dd_proba = models['discharge_disposition'].predict_proba(X_scaled)[0]
         dd_labels = ['Home', 'Facility', 'Death']
         fig = px.bar(x=dd_labels, y=dd_proba * 100,
                      color=dd_labels,
@@ -327,9 +374,9 @@ def show_predictions(models, data):
     st.subheader("Organ Support Predictions")
     os1, os2, os3 = st.columns(3)
     for col_ui, key, label in [
-        (os1, 'need_vent_any_xgb', 'Mechanical Ventilation'),
-        (os2, 'need_vasopressor_any_xgb', 'Vasopressors'),
-        (os3, 'need_rrt_any_xgb', 'Renal Replacement')
+        (os1, 'need_vent_any', 'Mechanical Ventilation'),
+        (os2, 'need_vasopressor_any', 'Vasopressors'),
+        (os3, 'need_rrt_any', 'Renal Replacement')
     ]:
         with col_ui:
             if key in models:
@@ -344,10 +391,10 @@ def show_predictions(models, data):
     st.subheader("Complication Onset Risk")
     dc1, dc2, dc3, dc4 = st.columns(4)
     for col_ui, key, label in [
-        (dc1, 'aki_onset_xgb', 'AKI'),
-        (dc2, 'ards_onset_xgb', 'ARDS'),
-        (dc3, 'liver_injury_onset_xgb', 'Liver Injury'),
-        (dc4, 'sepsis_onset_xgb', 'Sepsis')
+        (dc1, 'aki_onset', 'AKI'),
+        (dc2, 'ards_onset', 'ARDS'),
+        (dc3, 'liver_injury_onset', 'Liver Injury'),
+        (dc4, 'sepsis_onset', 'Sepsis')
     ]:
         with col_ui:
             if key in models:
@@ -403,97 +450,135 @@ def show_model_performance(results):
     """Display model performance metrics."""
     st.header("Model Performance Evaluation")
     
-    # Mortality models
+    # ── 1. Mortality ────────────────────────────────────────────────────────
     st.subheader("1. Mortality Prediction Models")
     
-    mortality_val = results['mortality']['validation']
+    mortality_val  = results['mortality']['validation']
     mortality_test = results['mortality']['test']
+    best_mortality = results['mortality']['best_model']
     
-    # Create comparison table
     comparison_data = []
     for model_name, metrics in mortality_val.items():
         comparison_data.append({
-            'Model': model_name.replace('_', ' ').title(),
-            'ROC-AUC': f"{metrics['roc_auc']:.4f}",
+            'Model': ('⭐ ' if model_name == best_mortality else '') +
+                     model_name.replace('_', ' ').title(),
+            'ROC-AUC':  f"{metrics['roc_auc']:.4f}",
             'Accuracy': f"{metrics['accuracy']:.4f}",
-            'Precision': f"{metrics['precision']:.4f}",
-            'Recall': f"{metrics['recall']:.4f}",
+            'Precision':f"{metrics['precision']:.4f}",
+            'Recall':   f"{metrics['recall']:.4f}",
             'F1-Score': f"{metrics['f1']:.4f}"
         })
     
-    df_comparison = pd.DataFrame(comparison_data)
-    st.dataframe(df_comparison, use_container_width=True, hide_index=True)
-    
-    # Best model test results
-    best_model = results['mortality']['best_model']
-    st.success(f"**Best Model:** {best_model.replace('_', ' ').title()}")
+    st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
+    st.success(f"**Best Model:** {best_mortality.replace('_', ' ').title()}")
     
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Test ROC-AUC", f"{mortality_test['roc_auc']:.4f}")
-    col2.metric("Accuracy", f"{mortality_test['accuracy']:.4f}")
-    col3.metric("Precision", f"{mortality_test['precision']:.4f}")
-    col4.metric("Recall", f"{mortality_test['recall']:.4f}")
+    col2.metric("Accuracy",     f"{mortality_test['accuracy']:.4f}")
+    col3.metric("Precision",    f"{mortality_test['precision']:.4f}")
+    col4.metric("Recall",       f"{mortality_test['recall']:.4f}")
     
     st.markdown("---")
     
-    # LOS Classification models
+    # ── 2. LOS Category ─────────────────────────────────────────────────────
+    # NOTE: results.json key is 'los_category' (not 'los_classification')
     st.subheader("2. Length of Stay Classification Models")
-    
-    los_val = results['los_classification']['validation']
-    los_test = results['los_classification']['test']
+
+    los_val  = results['los_category']['validation']
+    los_test = results['los_category']['test']
+    best_los = results['los_category']['best_model']
     
     comparison_data = []
     for model_name, metrics in los_val.items():
         comparison_data.append({
-            'Model': model_name.replace('_', ' ').title(),
-            'Accuracy': f"{metrics['accuracy']:.4f}",
-            'Precision': f"{metrics['precision_macro']:.4f}",
-            'Recall': f"{metrics['recall_macro']:.4f}",
-            'F1-Score': f"{metrics['f1_macro']:.4f}"
+            'Model':      ('⭐ ' if model_name == best_los else '') +
+                          model_name.replace('_', ' ').title(),
+            'Accuracy':   f"{metrics['accuracy']:.4f}",
+            'Precision':  f"{metrics['precision_macro']:.4f}",
+            'Recall':     f"{metrics['recall_macro']:.4f}",
+            'F1-Score':   f"{metrics['f1_macro']:.4f}",
+            'ROC-AUC':    f"{metrics['roc_auc_ovr_macro']:.4f}",
         })
     
-    df_comparison = pd.DataFrame(comparison_data)
-    st.dataframe(df_comparison, use_container_width=True, hide_index=True)
-    
-    best_model = results['los_classification']['best_model']
-    st.success(f"**Best Model:** {best_model.replace('_', ' ').title()}")
+    st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
+    st.success(f"**Best Model:** {best_los.replace('_', ' ').title()}")
     
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Test Accuracy", f"{los_test['accuracy']:.4f}")
-    col2.metric("Precision", f"{los_test['precision_macro']:.4f}")
-    col3.metric("Recall", f"{los_test['recall_macro']:.4f}")
-    col4.metric("F1-Score", f"{los_test['f1_macro']:.4f}")
+    col1.metric("Test Accuracy",  f"{los_test['accuracy']:.4f}")
+    col2.metric("Precision",      f"{los_test['precision_macro']:.4f}")
+    col3.metric("Recall",         f"{los_test['recall_macro']:.4f}")
+    col4.metric("F1-Score",       f"{los_test['f1_macro']:.4f}")
 
-    # --- Extended target results ---
+    # ── 3. Extended targets ─────────────────────────────────────────────────
+    # Binary tasks: roc_auc, accuracy, precision, recall, f1
+    # Multiclass tasks: roc_auc_ovr_macro, accuracy, precision_macro, recall_macro, f1_macro
+    BINARY_METRICS = [
+        ('roc_auc',   'ROC-AUC'),
+        ('accuracy',  'Accuracy'),
+        ('precision', 'Precision'),
+        ('recall',    'Recall'),
+        ('f1',        'F1-Score'),
+    ]
+    MULTI_METRICS = [
+        ('roc_auc_ovr_macro',  'ROC-AUC'),
+        ('accuracy',           'Accuracy'),
+        ('precision_macro',    'Precision'),
+        ('recall_macro',       'Recall'),
+        ('f1_macro',           'F1-Score'),
+    ]
+    MULTICLASS_TASKS = {'discharge_disposition'}
+
     extended_targets = {
-        'icu_readmit_48h': 'ICU Readmission (48h)',
-        'icu_readmit_7d': 'ICU Readmission (7d)',
+        'icu_readmit_48h':       'ICU Readmission (48h)',
+        'icu_readmit_7d':        'ICU Readmission (7d)',
         'discharge_disposition': 'Discharge Disposition',
-        'need_vent_any': 'Mechanical Ventilation',
-        'need_vasopressor_any': 'Vasopressor Use',
-        'need_rrt_any': 'Renal Replacement',
-        'aki_onset': 'AKI Onset',
-        'ards_onset': 'ARDS Onset',
-        'liver_injury_onset': 'Liver Injury Onset',
-        'sepsis_onset': 'Sepsis Onset',
+        'need_vent_any':         'Mechanical Ventilation',
+        'need_vasopressor_any':  'Vasopressor Use',
+        'need_rrt_any':          'Renal Replacement',
+        'aki_onset':             'AKI Onset',
+        'ards_onset':            'ARDS Onset',
+        'liver_injury_onset':    'Liver Injury Onset',
+        'sepsis_onset':          'Sepsis Onset',
     }
+
     shown_any = False
-    for key, title in extended_targets.items():
-        if key in results:
-            if not shown_any:
-                st.markdown("---")
-                st.subheader("3. Extended Target Models")
-                shown_any = True
-            test_m = results[key].get('test', {})
-            cols = st.columns(5)
-            cols[0].markdown(f"**{title}**")
-            for i, (metric, label) in enumerate([
-                ('roc_auc', 'ROC-AUC'), ('accuracy', 'Acc'),
-                ('f1', 'F1'), ('f1_macro', 'F1-macro')
-            ]):
-                val = test_m.get(metric)
-                if val is not None:
-                    cols[i + 1].metric(label, f"{val:.4f}")
+    for i, (key, title) in enumerate(extended_targets.items()):
+        if key not in results:
+            continue
+
+        if not shown_any:
+            st.markdown("---")
+            st.subheader("3. Extended Target Models")
+            shown_any = True
+
+        st.markdown(f"#### {i + 3}. {title}")
+
+        task_results = results[key]
+        val_results  = task_results.get('validation', {})
+        test_metrics = task_results.get('test', {})
+        best         = task_results.get('best_model', '')
+        metrics      = MULTI_METRICS if key in MULTICLASS_TASKS else BINARY_METRICS
+
+        # Validation comparison table (all models)
+        rows = []
+        for model_name, model_metrics in val_results.items():
+            row = {'Model': ('⭐ ' if model_name == best else '') +
+                            model_name.replace('_', ' ').title()}
+            for metric_key, metric_label in metrics:
+                val = model_metrics.get(metric_key)
+                row[metric_label] = f"{val:.4f}" if val is not None else 'N/A'
+            rows.append(row)
+
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.success(f"**Best Model:** {best.replace('_', ' ').title()}")
+
+        # Test set metrics for the best model
+        test_cols = st.columns(len(metrics))
+        for col, (metric_key, metric_label) in zip(test_cols, metrics):
+            val = test_metrics.get(metric_key)
+            col.metric(f"Test {metric_label}", f"{val:.4f}" if val is not None else 'N/A')
+
+        st.markdown("---")
 
 def show_about():
     """Display about page."""
@@ -514,9 +599,12 @@ def show_about():
     6. **Disease Onset** — AKI, ARDS, Liver Injury, Sepsis
     
     ### Models Used
-    - **Logistic Regression** (Baseline for mortality & LOS)
-    - **Random Forest** (Baseline for mortality & LOS)
-    - **XGBoost** (Primary model for all targets)
+    - **Logistic Regression** (Baseline)
+    - **Random Forest** (Ensemble)
+    - **XGBoost** (Gradient Boosting)
+    - **CatBoost** (Gradient Boosting)
+    
+    The best-performing model per task (by validation ROC-AUC) is selected automatically.
     
     ### Dataset
     - **Source:** MIMIC-IV v2.2 (Medical Information Mart for Intensive Care)
@@ -525,7 +613,7 @@ def show_about():
     
     ### Technologies
     - Python 3.11
-    - Scikit-learn, XGBoost
+    - Scikit-learn, XGBoost, CatBoost
     - Streamlit (Dashboard)
     - Pandas, NumPy (Data processing)
     - Plotly (Visualizations)
