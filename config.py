@@ -70,6 +70,60 @@ TOP_N_PROCEDURES = 30
 LAB_WINDOWS = [6, 12, 24, 48]
 
 # ============================================================================
+# FEATURE ENGINEERING V2 (Clinically grounded pool)
+# ============================================================================
+FEATURE_WINDOW_HOURS_V2 = 24
+
+# ICU charted vital itemids (MIMIC-IV meta-vision + carevue common IDs)
+VITAL_ITEMIDS_V2 = {
+    'heart_rate': [220045, 211],
+    'resp_rate': [220210, 618, 224690, 615],
+    'map': [220052, 456, 220181, 52, 6702, 443, 225312],
+    'spo2': [220277, 646],
+    # Includes Celsius and Fahrenheit itemids; code normalizes Fahrenheit to Celsius.
+    'temperature_c': [223762, 676, 223761, 678, 679],
+}
+
+# Urine output (ICU outputevents) itemids
+URINE_OUTPUT_ITEMIDS_V2 = [226559, 226560, 226561, 226584, 226563, 226564]
+
+# Key labs used for first-24h physiological feature extraction
+LAB_ITEMIDS_V2 = {
+    'creatinine': [50912],
+    'bun': [51006],
+    'lactate': [50813],
+    'bicarbonate': [50882, 50803],
+    'anion_gap': [50868],
+    'wbc': [51300, 51301, 51755],
+    'hemoglobin': [51222, 50811],
+    'platelets': [51265],
+    'inr': [51237, 51274],
+    'sodium': [50983, 50824],
+    'potassium': [50971, 50822],
+    'glucose': [50931, 50809],
+    'albumin': [50862, 53085],
+    'bilirubin': [50885],
+    'alt': [50861],
+    'ast': [50878],
+}
+
+# Curated comorbidity code prefixes (ICD-9/10 mixed, hadm-level context only)
+COMORBIDITY_PREFIXES_V2 = {
+    'ckd': ['585', 'N18'],
+    'copd': ['491', '492', '496', 'J44'],
+    'diabetes': ['250', 'E10', 'E11', 'E13'],
+    'chf': ['428', 'I50'],
+    'chronic_liver_disease': ['571', 'K70', 'K74', 'K76'],
+    'malignancy': ['140', '141', '142', '143', '144', '145', '146', '147', '148', '149',
+                   '150', '151', '152', '153', '154', '155', '156', '157', '158', '159',
+                   '160', '161', '162', '163', '164', '165', '170', '171', '172', '174',
+                   '179', '180', '181', '182', '183', '184', '185', '186', '187', '188',
+                   '189', '190', '191', '192', '193', '194', '195', '196', '197', '198',
+                   '199', 'C'],
+    'hypertension': ['401', '402', '403', '404', '405', 'I10', 'I11', 'I12', 'I13'],
+}
+
+# ============================================================================
 # MODEL HYPERPARAMETERS (Default)
 # ============================================================================
 XGBOOST_PARAMS = {
