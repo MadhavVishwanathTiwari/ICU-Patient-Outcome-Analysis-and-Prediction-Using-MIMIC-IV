@@ -1,7 +1,7 @@
 """
-Phase 3: The Complete Matrix Tournament
+Phase 3: The Complete Matrix Tournament (With ROC Curves)
 Evaluates 12 Clinical Targets across 4 Mathematical Matrices using 5 Models.
-Outputs results in Markdown Tables.
+Outputs results in Markdown Tables and saves winning ROC curves as PNGs.
 """
 
 import pandas as pd
@@ -10,10 +10,11 @@ from pathlib import Path
 import os
 import gc
 
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder, label_binarize
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve, auc
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
@@ -44,10 +45,8 @@ TARGETS = {
     'discharge_disposition': 'multiclass'
 }
 
-# The 13th target (regression) that must also be dropped to prevent leakage
 REGRESSION_TARGET = 'los_days'
 
-# 2. Define the Matrices mapping
 MATRICES = {
     'IG': 'X_ig_union.csv',
     'ANOVA': 'X_anova_union.csv',
@@ -68,7 +67,6 @@ def get_baseline_models(task_type, n_classes):
         }
     else:
         return {
-            # Fix: Removed the deprecated multi_class parameter
             'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced'),
             'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced', n_jobs=-1),
             'XGBoost': xgb.XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', objective='multi:softprob', num_class=n_classes, random_state=42, n_jobs=-1),
@@ -76,7 +74,7 @@ def get_baseline_models(task_type, n_classes):
         }
 
 def build_custom_mlp(input_dim, task_type, n_classes):
-    """Dynamically builds the Custom Deep Learning architecture for the specific target"""
+    """Dynamically builds the Custom Deep Learning architecture"""
     model = Sequential([
         Dense(128, activation='relu', input_shape=(input_dim,)),
         Dropout(0.3),
@@ -89,28 +87,64 @@ def build_custom_mlp(input_dim, task_type, n_classes):
         model.add(Dense(1, activation='sigmoid'))
         model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['AUC'])
     else:
-        # Multiclass requires Softmax and Sparse Categorical Crossentropy
         model.add(Dense(n_classes, activation='softmax'))
         model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
         
     return model
 
+def plot_winning_roc(target_name, model_name, matrix_name, best_auc, y_test, preds, task_type, n_classes):
+    """Plots and saves the ROC curve for the winning configuration"""
+    plt.figure(figsize=(8, 6))
+    
+    if task_type == 'binary':
+        fpr, tpr, _ = roc_curve(y_test, preds)
+        plt.plot(fpr, tpr, lw=2, color='darkorange', label=f'ROC curve (AUC = {best_auc:.4f})')
+    else:
+        # For Multiclass: plot One-vs-Rest ROC for each class
+        y_test_bin = label_binarize(y_test, classes=range(n_classes))
+        for i in range(n_classes):
+            fpr, tpr, _ = roc_curve(y_test_bin[:, i], preds[:, i])
+            class_auc = auc(fpr, tpr)
+            plt.plot(fpr, tpr, lw=1.5, alpha=0.8, label=f'Class {i} (AUC = {class_auc:.4f})')
+            
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate', fontweight='bold')
+    plt.ylabel('True Positive Rate', fontweight='bold')
+    plt.title(f'Winning Configuration: {target_name.upper()}\n{model_name} on {matrix_name} Matrix', fontweight='bold', pad=15)
+    plt.legend(loc="lower right")
+    plt.grid(alpha=0.3)
+    
+    # Save the plot
+    filepath = f"results/roc_curves/roc_{target_name}.png"
+    plt.savefig(filepath, dpi=300, bbox_inches='tight')
+    plt.close()
+
 def run_full_tournament():
     print("=" * 80)
-    print("INITIALIZING 240-MODEL MATRIX TOURNAMENT")
+    print("INITIALIZING 240-MODEL MATRIX TOURNAMENT (WITH ROC GENERATION)")
     print("=" * 80)
 
     data_dir = Path('data/processed/tournament')
     
-    # Initialize the nested results dictionary
+    # Create directory for saving the plots
+    os.makedirs('results/roc_curves', exist_ok=True)
+    
     results = {t: {m: {mat: None for mat in MATRICES.keys()} for m in MODEL_NAMES} for t in TARGETS.keys()}
-
-    # All targets that must be dropped from X to prevent Target Leakage
     all_target_cols = list(TARGETS.keys()) + [REGRESSION_TARGET]
     id_cols = ['subject_id', 'hadm_id', 'stay_id']
 
     for target_name, task_type in TARGETS.items():
         print(f"\n>> EVALUATING TARGET: {target_name.upper()} ({task_type})")
+        
+        # Tracking variables for the "King of the Hill" winning model
+        best_auc = -1
+        best_model_name = ""
+        best_matrix_name = ""
+        best_y_test = None
+        best_preds = None
+        best_n_classes = None
         
         for matrix_name, matrix_file in MATRICES.items():
             matrix_path = data_dir / matrix_file
@@ -118,35 +152,26 @@ def run_full_tournament():
                 continue
                 
             df = pd.read_csv(matrix_path)
-            
-            # Clean XGBoost illegal characters
             df.columns = [col.replace('[', '').replace(']', '').replace('<', 'lt').replace('>', 'gt') for col in df.columns]
 
             if target_name not in df.columns:
-                print(f"  [-] {matrix_name}: Target missing, skipping.")
                 continue
 
-            # Drop rows where the *target outcome itself* is missing
             df_clean = df.dropna(subset=[target_name]).copy()
             
-            # Label Encode Y (Required for Multiclass, safe for Binary)
             le = LabelEncoder()
             y_encoded = le.fit_transform(df_clean[target_name])
             n_classes = len(le.classes_)
 
-            # Prevent Target Leakage by dropping IDs and all targets
             drop_cols = [c for c in id_cols + all_target_cols if c in df_clean.columns]
             X = df_clean.drop(columns=drop_cols)
             
-            # 1. Split Data
             X_train, X_test, y_train, y_test = train_test_split(X, y_encoded, test_size=0.20, random_state=42, stratify=y_encoded)
             
-            # 2. IMPUTE MISSING CLINICAL VALUES
             imputer = SimpleImputer(strategy='median')
             X_train_imp = imputer.fit_transform(X_train)
             X_test_imp = imputer.transform(X_test)
 
-            # 3. Scale Features
             scaler = StandardScaler()
             X_train_scaled = scaler.fit_transform(X_train_imp)
             X_test_scaled = scaler.transform(X_test_imp)
@@ -159,12 +184,21 @@ def run_full_tournament():
                 
                 if task_type == 'binary':
                     preds = model.predict_proba(X_test_scaled)[:, 1]
-                    auc = roc_auc_score(y_test, preds)
+                    auc_val = roc_auc_score(y_test, preds)
                 else:
                     preds = model.predict_proba(X_test_scaled)
-                    auc = roc_auc_score(y_test, preds, multi_class='ovr', average='macro')
+                    auc_val = roc_auc_score(y_test, preds, multi_class='ovr', average='macro')
                 
-                results[target_name][model_name][matrix_name] = auc
+                results[target_name][model_name][matrix_name] = auc_val
+                
+                # Check if this is the new champion
+                if auc_val > best_auc:
+                    best_auc = auc_val
+                    best_model_name = model_name
+                    best_matrix_name = matrix_name
+                    best_y_test = y_test.copy()
+                    best_preds = preds.copy()
+                    best_n_classes = n_classes
 
             # --- TRAIN CUSTOM MLP ---
             print(f"  [+] Training Custom MLP          on {matrix_name:5}...", end='\r')
@@ -174,18 +208,34 @@ def run_full_tournament():
             custom_model.fit(X_train_scaled, y_train, epochs=100, batch_size=64, validation_split=0.2, callbacks=[early_stop], verbose=0)
             
             mlp_preds = custom_model.predict(X_test_scaled, verbose=0)
+            
             if task_type == 'binary':
-                mlp_auc = roc_auc_score(y_test, mlp_preds.flatten())
+                mlp_preds_clean = mlp_preds.flatten()
+                mlp_auc = roc_auc_score(y_test, mlp_preds_clean)
             else:
-                mlp_auc = roc_auc_score(y_test, mlp_preds, multi_class='ovr', average='macro')
+                mlp_preds_clean = mlp_preds
+                mlp_auc = roc_auc_score(y_test, mlp_preds_clean, multi_class='ovr', average='macro')
                 
             results[target_name]['Custom MLP'][matrix_name] = mlp_auc
             
-            # Clear RAM after heavy deep learning iteration
+            # Check if Custom MLP is the new champion
+            if mlp_auc > best_auc:
+                best_auc = mlp_auc
+                best_model_name = 'Custom MLP'
+                best_matrix_name = matrix_name
+                best_y_test = y_test.copy()
+                best_preds = mlp_preds_clean.copy()
+                best_n_classes = n_classes
+            
             K.clear_session()
             gc.collect()
             
             print(f"  [*] {matrix_name} Matrix fully evaluated for {target_name}.    ")
+
+        # --- END OF TARGET LOOP: PLOT THE WINNER ---
+        if best_preds is not None:
+            print(f"\n  🏆 Plotting winning configuration for {target_name}: {best_model_name} on {best_matrix_name}")
+            plot_winning_roc(target_name, best_model_name, best_matrix_name, best_auc, best_y_test, best_preds, task_type, best_n_classes)
 
     # 3. Output the Final Markdown Tables
     print("\n" + "=" * 80)
