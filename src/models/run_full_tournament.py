@@ -1,14 +1,21 @@
 """
-Phase 3: The Complete Matrix Tournament (With ROC Curves)
+Phase 3: The Complete Matrix Tournament (With ROC Curves & Smart Skip)
 Evaluates 12 Clinical Targets across 4 Mathematical Matrices using 5 Models.
 Outputs results in Markdown Tables and saves winning ROC curves as PNGs.
 """
 
 import pandas as pd
 import numpy as np
+import sys
 from pathlib import Path
 import os
 import gc
+import json
+
+_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from src.features.leakage_rules import drop_organ_support_leaky_columns
 
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
@@ -109,7 +116,7 @@ def plot_winning_roc(target_name, model_name, matrix_name, best_auc, y_test, pre
             
     plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
     plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
+    plt.ylim([0.0, 1.0]) # Capped exactly at 1.0 for aesthetic perfection
     plt.xlabel('False Positive Rate', fontweight='bold')
     plt.ylabel('True Positive Rate', fontweight='bold')
     plt.title(f'Winning Configuration: {target_name.upper()}\n{model_name} on {matrix_name} Matrix', fontweight='bold', pad=15)
@@ -123,20 +130,35 @@ def plot_winning_roc(target_name, model_name, matrix_name, best_auc, y_test, pre
 
 def run_full_tournament():
     print("=" * 80)
-    print("INITIALIZING 240-MODEL MATRIX TOURNAMENT (WITH ROC GENERATION)")
+    print("INITIALIZING 240-MODEL MATRIX TOURNAMENT (WITH SMART SKIP)")
     print("=" * 80)
 
     data_dir = Path('data/processed/tournament')
+    out_dir = Path('results/roc_curves')
     
     # Create directory for saving the plots
-    os.makedirs('results/roc_curves', exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     
-    results = {t: {m: {mat: None for mat in MATRICES.keys()} for m in MODEL_NAMES} for t in TARGETS.keys()}
+    results_file = Path('results/tournament_scores.json')
+    if results_file.exists():
+        with open(results_file, 'r') as f:
+            results = json.load(f)
+        print("  [+] Successfully loaded previous tournament scores from JSON.")
+    else:
+        results = {t: {m: {mat: None for mat in MATRICES.keys()} for m in MODEL_NAMES} for t in TARGETS.keys()}
     all_target_cols = list(TARGETS.keys()) + [REGRESSION_TARGET]
     id_cols = ['subject_id', 'hadm_id', 'stay_id']
 
     for target_name, task_type in TARGETS.items():
         print(f"\n>> EVALUATING TARGET: {target_name.upper()} ({task_type})")
+        
+        # ---------------------------------------------------------
+        # SMART SKIP LOGIC: Check if PNG already exists
+        # ---------------------------------------------------------
+        expected_plot_path = out_dir / f"roc_{target_name}.png"
+        if expected_plot_path.exists():
+            print(f"  [skip] already complete — delete {expected_plot_path.name} to re-run.")
+            continue
         
         # Tracking variables for the "King of the Hill" winning model
         best_auc = -1
@@ -165,7 +187,8 @@ def run_full_tournament():
 
             drop_cols = [c for c in id_cols + all_target_cols if c in df_clean.columns]
             X = df_clean.drop(columns=drop_cols)
-            
+            X = drop_organ_support_leaky_columns(X, target_name) # Fixes Leakage!
+
             X_train, X_test, y_train, y_test = train_test_split(X, y_encoded, test_size=0.20, random_state=42, stratify=y_encoded)
             
             imputer = SimpleImputer(strategy='median')
@@ -236,6 +259,11 @@ def run_full_tournament():
         if best_preds is not None:
             print(f"\n  🏆 Plotting winning configuration for {target_name}: {best_model_name} on {best_matrix_name}")
             plot_winning_roc(target_name, best_model_name, best_matrix_name, best_auc, best_y_test, best_preds, task_type, best_n_classes)
+
+    # --- SAVE UPDATED DICTIONARY TO JSON ---
+    with open(results_file, 'w') as f:
+        json.dump(results, f, indent=4)
+    print("\n  [+] Checkpoint saved: Updated tournament scores written to JSON.")
 
     # 3. Output the Final Markdown Tables
     print("\n" + "=" * 80)

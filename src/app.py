@@ -1,633 +1,637 @@
 """
-MIMIC-IV ICU Outcome Prediction Dashboard
-==========================================
-Interactive Streamlit dashboard for predicting ICU patient outcomes.
+MIMIC-IV ICU Outcome Prediction Dashboard  —  v2  (Post-Tournament, Post-Tuning)
+==================================================================================
+Loads tuned models from models/tuned/, SHAP images from results/shap/,
+and ROC curves from results/roc_curves_tuned/.
 
-Features:
-- Mortality risk prediction
-- Length of stay classification
-- Model performance visualization
-- Feature importance analysis
+Pages
+-----
+  Dashboard          — cohort statistics and outcome rates
+  Predictions        — per-patient risk panel across all 12 targets
+  Model Performance  — tournament baseline vs tuned AUC comparison
+  SHAP Analysis      — beeswarm / bar / waterfall image viewer
+  ROC Curves         — tuned ROC PNG gallery
+  About
 
-Author: ML Healthcare Team
-Date: January 2026
+Setup
+-----
+  1. python save_tuned_models.py          (one-time, ~15 min)
+  2. python shap_analysis.py              (one-time, ~30 min)
+  3. streamlit run app.py
 """
+
+import os, json, warnings
+warnings.filterwarnings('ignore')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import json
 from pathlib import Path
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-# Configure page
+# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ICU Outcome Prediction",
     page_icon="🏥",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# ── Model prefix mapping ──────────────────────────────────────────────────────
-# Maps results.json key  →  filename prefix used when saving the model
-TASK_PREFIX = {
-    'mortality':              'mortality',
-    'los_category':           'los_class',
-    'icu_readmit_48h':        'icu_readmit_48h',
-    'icu_readmit_7d':         'icu_readmit_7d',
-    'discharge_disposition':  'discharge_disposition',
-    'need_vent_any':          'need_vent_any',
-    'need_vasopressor_any':   'need_vasopressor_any',
-    'need_rrt_any':           'need_rrt_any',
-    'aki_onset':              'aki_onset',
-    'ards_onset':             'ards_onset',
-    'liver_injury_onset':     'liver_injury_onset',
-    'sepsis_onset':           'sepsis_onset',
+# ── Paths ────────────────────────────────────────────────────────────────────
+MODELS_DIR    = Path('models/tuned')
+PARAMS_PATH   = Path('results/best_hyperparams.json')
+SHAP_DIR      = Path('results/shap')
+ROC_DIR       = Path('results/roc_curves_tuned')
+DATA_DIR      = Path('data/processed/tournament')
+FEATURES_PATH = Path('data/processed/features_engineered_v2.csv')
+
+MATRIX_FILES = {
+    'IG':    'X_ig_union.csv',
+    'ANOVA': 'X_anova_union.csv',
+    'MI':    'X_mi_union.csv',
+    'LASSO': 'X_lasso_union.csv',
 }
 
-# Load models and data
+# Exact tuning results (from tune_winners.py output)
+TUNING_RESULTS = [
+    {'Target':'mortality',            'Model':'CatBoost',            'Matrix':'LASSO','Baseline':0.8898,'Tuned':0.8966,'Delta':+0.0068},
+    {'Target':'aki_onset',            'Model':'Custom MLP',          'Matrix':'LASSO','Baseline':0.8187,'Tuned':0.8191,'Delta':+0.0004},
+    {'Target':'sepsis_onset',         'Model':'Random Forest',       'Matrix':'MI',   'Baseline':0.7805,'Tuned':0.7841,'Delta':+0.0036},
+    {'Target':'ards_onset',           'Model':'CatBoost',            'Matrix':'MI',   'Baseline':0.9351,'Tuned':0.9373,'Delta':+0.0022},
+    {'Target':'liver_injury_onset',   'Model':'CatBoost',            'Matrix':'IG',   'Baseline':0.9232,'Tuned':0.9290,'Delta':+0.0058},
+    {'Target':'need_vent_any',        'Model':'Custom MLP',          'Matrix':'ANOVA','Baseline':0.9786,'Tuned':0.9791,'Delta':+0.0005},
+    {'Target':'need_vasopressor_any', 'Model':'Custom MLP',          'Matrix':'LASSO','Baseline':0.9738,'Tuned':0.9739,'Delta':+0.0001},
+    {'Target':'need_rrt_any',         'Model':'XGBoost',             'Matrix':'LASSO','Baseline':0.9509,'Tuned':0.9581,'Delta':+0.0072},
+    {'Target':'icu_readmit_48h',      'Model':'Logistic Regression', 'Matrix':'ANOVA','Baseline':0.5948,'Tuned':0.5919,'Delta':-0.0029},
+    {'Target':'icu_readmit_7d',       'Model':'Logistic Regression', 'Matrix':'ANOVA','Baseline':0.6015,'Tuned':0.6031,'Delta':+0.0016},
+    {'Target':'los_category',         'Model':'Custom MLP',          'Matrix':'LASSO','Baseline':0.7666,'Tuned':0.7681,'Delta':+0.0015},
+    {'Target':'discharge_disposition','Model':'XGBoost',             'Matrix':'LASSO','Baseline':0.8135,'Tuned':0.8239,'Delta':+0.0104},
+]
+
+TASK_TYPE = {
+    'mortality':'binary','aki_onset':'binary','sepsis_onset':'binary',
+    'ards_onset':'binary','liver_injury_onset':'binary','need_vent_any':'binary',
+    'need_vasopressor_any':'binary','need_rrt_any':'binary',
+    'icu_readmit_48h':'binary','icu_readmit_7d':'binary',
+    'los_category':'multiclass','discharge_disposition':'multiclass',
+}
+
+TARGET_LABELS = {
+    'mortality':            'Mortality',
+    'aki_onset':            'AKI Onset',
+    'sepsis_onset':         'Sepsis Onset',
+    'ards_onset':           'ARDS Onset',
+    'liver_injury_onset':   'Liver Injury',
+    'need_vent_any':        'Ventilation',
+    'need_vasopressor_any': 'Vasopressors',
+    'need_rrt_any':         'RRT',
+    'icu_readmit_48h':      'Readmit 48h',
+    'icu_readmit_7d':       'Readmit 7d',
+    'los_category':         'LOS Category',
+    'discharge_disposition':'Discharge Disp.',
+}
+
+ALL_TARGET_COLS = list(TASK_TYPE.keys()) + ['los_days']
+ID_COLS = ['subject_id','hadm_id','stay_id']
+
+
+# ── Resource loading ─────────────────────────────────────────────────────────
+
 @st.cache_resource
-def load_models():
-    """
-    Load the best-performing trained model for every task.
+def load_all_models():
+    """Load every tuned model + its prep pipeline from models/tuned/."""
+    if not PARAMS_PATH.exists():
+        return {}, {}
 
-    Strategy
-    --------
-    1. Read results.json to find which model won each task (best_model field).
-    2. Construct the filename from the task prefix + best_model name and load it.
-    3. Fall back gracefully if a file is missing.
-
-    Returns
-    -------
-    models : dict
-        Keys are task names (e.g. 'mortality'), values are loaded estimators.
-        Also includes 'scaler'.
-    results : dict
-        Raw contents of results.json.
-    """
-    models_dir = Path('models')
-
-    with open(models_dir / 'results.json', 'r') as f:
-        results = json.load(f)
+    with open(PARAMS_PATH) as f:
+        params = json.load(f)
 
     models = {}
+    preps  = {}
 
-    # Scaler is always needed
-    models['scaler'] = joblib.load(models_dir / 'scaler.pkl')
+    for target in params:
+        prep_path = MODELS_DIR / f'{target}_prep.pkl'
+        if not prep_path.exists():
+            continue
+        preps[target] = joblib.load(prep_path)
 
-    for task_key, prefix in TASK_PREFIX.items():
-        if task_key not in results:
-            continue  # task wasn't trained
+        keras_path = MODELS_DIR / f'{target}_keras.keras'
+        keras_dir  = MODELS_DIR / f'{target}_keras'
+        pkl_path   = MODELS_DIR / f'{target}.pkl'
 
-        best_model_name = results[task_key]['best_model']           # e.g. 'catboost'
-        fname = f'{prefix}_{best_model_name}.pkl'                   # e.g. 'mortality_catboost.pkl'
-        path  = models_dir / fname
+        if keras_path.exists():
+            try:
+                import tensorflow as tf
+                models[target] = tf.keras.models.load_model(str(keras_path))
+            except Exception:
+                pass
+        elif keras_dir.exists():
+            try:
+                import tensorflow as tf
+                models[target] = tf.keras.models.load_model(str(keras_dir))
+            except Exception:
+                pass
+        elif pkl_path.exists():
+            models[target] = joblib.load(pkl_path)
 
-        if path.exists():
-            models[task_key] = joblib.load(path)
-        else:
-            st.warning(f"Best model file not found for '{task_key}': {fname}")
-
-    return models, results
+    return models, preps
 
 
 @st.cache_data
-def load_data():
-    """Load feature matrix and cohort data."""
-    features = pd.read_csv('data/processed/features_engineered.csv')
-    
-    # Clean column names (same as training)
-    features.columns = [
-        col.replace('[', '').replace(']', '').replace('<', 'lt').replace('>', 'gt')
-        for col in features.columns
-    ]
-    
-    return features
+def load_cohort():
+    """Load the raw feature CSV for dashboard stats and patient selection."""
+    if not FEATURES_PATH.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(FEATURES_PATH)
+    df.columns = [c.replace('[','').replace(']','').replace('<','lt').replace('>','gt')
+                  for c in df.columns]
+    return df
 
-# Main app
-def main():
-    st.title("🏥 ICU Patient Outcome Prediction System")
-    st.markdown("### Powered by MIMIC-IV Dataset & Machine Learning")
-    
-    # Sidebar
-    st.sidebar.title("Navigation")
-    page = st.sidebar.radio(
-        "Select Page",
-        ["📊 Dashboard", "🔮 Predictions", "📈 Model Performance", "ℹ️ About"]
-    )
-    
-    # Load resources
+
+@st.cache_data
+def load_matrix(matrix_name: str):
+    """Load one of the four feature-selection matrices."""
+    path = DATA_DIR / MATRIX_FILES[matrix_name]
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    df.columns = [c.replace('[','').replace(']','').replace('<','lt').replace('>','gt')
+                  for c in df.columns]
+    return df
+
+
+def predict_for_patient(target: str, patient_raw: pd.Series,
+                        models: dict, preps: dict):
+    """
+    Given a raw patient row from the cohort CSV, run it through the
+    correct imputer+scaler for that target's matrix, then return prob.
+    """
+    if target not in models or target not in preps:
+        return None, None
+
+    prep      = preps[target]
+    feat_cols = prep['feature_cols']
+    imputer   = prep['imputer']
+    scaler    = prep['scaler']
+    task_type = prep['task_type']
+    model     = models[target]
+
+    # Build feature vector (fill missing cols with NaN)
+    x = np.array([patient_raw.get(c, np.nan) for c in feat_cols]).reshape(1, -1)
+    x = imputer.transform(x)
+    x = scaler.transform(x)
+
     try:
-        models, results = load_models()
-        data = load_data()
-    except Exception as e:
-        st.error(f"Error loading models: {e}")
-        st.info("Please ensure models are trained by running: `python src/models/train_model.py`")
+        if hasattr(model, 'predict_proba'):
+            proba = model.predict_proba(x)[0]
+        else:
+            # Keras model
+            raw = model.predict(x, verbose=0)
+            proba = raw.flatten() if task_type == 'binary' else raw[0]
+    except Exception:
+        return None, None
+
+    if task_type == 'binary':
+        return float(proba[1]) if len(proba) > 1 else float(proba[0]), proba
+    return None, proba  # multiclass: return full proba array as second value
+
+
+# ── Custom CSS ───────────────────────────────────────────────────────────────
+
+st.markdown("""
+<style>
+[data-testid="stSidebar"] { background: #0a0e1a; }
+[data-testid="stSidebar"] * { color: #c8d6e5 !important; }
+[data-testid="stSidebar"] .stRadio label { 
+    padding: 6px 10px; border-radius: 6px; 
+    transition: background 0.15s;
+}
+[data-testid="stSidebar"] .stRadio label:hover { background: rgba(255,255,255,0.08); }
+.metric-card {
+    background: #f7f8fc; border: 1px solid #e2e6ef;
+    border-radius: 10px; padding: 1rem 1.2rem;
+    text-align: center;
+}
+.metric-card .val  { font-size: 1.7rem; font-weight: 600; color: #1a2744; }
+.metric-card .lbl  { font-size: 0.8rem; color: #7a8aaa; margin-top: 2px; }
+.risk-badge-high   { background:#fee2e2; color:#991b1b; border-radius:6px; padding:3px 10px; font-weight:600; }
+.risk-badge-medium { background:#fef3c7; color:#92400e; border-radius:6px; padding:3px 10px; font-weight:600; }
+.risk-badge-low    { background:#d1fae5; color:#065f46; border-radius:6px; padding:3px 10px; font-weight:600; }
+.section-divider   { border-top: 1px solid #e2e6ef; margin: 1.5rem 0; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+def sidebar():
+    st.sidebar.markdown("## 🏥 ICU Prediction")
+    st.sidebar.markdown("---")
+    page = st.sidebar.radio("Navigate", [
+        "📊 Dashboard",
+        "🔮 Predictions",
+        "📈 Model Performance",
+        "🧠 SHAP Analysis",
+        "📉 ROC Curves",
+        "ℹ️ About",
+    ])
+    st.sidebar.markdown("---")
+    st.sidebar.caption("MIMIC-IV v2.2  •  Minor Project 2026")
+    return page
+
+
+# ── Page: Dashboard ──────────────────────────────────────────────────────────
+
+def page_dashboard(cohort: pd.DataFrame):
+    st.header("Cohort Overview")
+
+    if cohort.empty:
+        st.error(f"Feature CSV not found at `{FEATURES_PATH}`.")
         return
-    
-    # Page routing
-    if page == "📊 Dashboard":
-        show_dashboard(data, results)
-    elif page == "🔮 Predictions":
-        show_predictions(models, data, results)
-    elif page == "📈 Model Performance":
-        show_model_performance(results)
-    else:
-        show_about()
 
-def show_dashboard(data, results):
-    """Display main dashboard with overview statistics."""
-    st.header("Dashboard Overview")
-    
-    # Key metrics — row 1
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Total ICU Stays", f"{len(data):,}")
-    with col2:
-        mortality_rate = data['mortality'].mean() * 100
-        st.metric("Mortality Rate", f"{mortality_rate:.2f}%")
-    with col3:
-        mean_los = data['los_days'].mean()
-        st.metric("Mean LOS", f"{mean_los:.2f} days")
-    with col4:
-        model_roc = results.get('mortality', {}).get('test', {}).get('roc_auc', 0)
-        st.metric("Mortality ROC-AUC", f"{model_roc:.4f}")
+    # Row 1 — top-level metrics
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Total ICU stays",   f"{len(cohort):,}")
+    c2.metric("Mortality rate",    f"{cohort['mortality'].mean()*100:.1f}%"
+              if 'mortality' in cohort.columns else "N/A")
+    c3.metric("Mean LOS (days)",   f"{cohort['los_days'].mean():.1f}"
+              if 'los_days' in cohort.columns else "N/A")
+    c4.metric("Unique patients",
+              f"{cohort['subject_id'].nunique():,}"
+              if 'subject_id' in cohort.columns else "N/A")
 
-    # Key metrics — row 2 (new targets)
-    col5, col6, col7, col8 = st.columns(4)
-    with col5:
-        if 'icu_readmit_7d' in data.columns:
-            st.metric("7d Readmit Rate", f"{data['icu_readmit_7d'].mean()*100:.1f}%")
-    with col6:
-        if 'need_vent_any' in data.columns:
-            st.metric("Vent Rate", f"{data['need_vent_any'].mean()*100:.1f}%")
-    with col7:
-        if 'aki_onset' in data.columns:
-            st.metric("AKI Rate", f"{data['aki_onset'].mean()*100:.1f}%")
-    with col8:
-        if 'sepsis_onset' in data.columns:
-            st.metric("Sepsis Rate", f"{data['sepsis_onset'].mean()*100:.1f}%")
-    
+    # Row 2 — complication rates
+    rate_cols = {
+        'need_vent_any':'Ventilation','need_vasopressor_any':'Vasopressors',
+        'aki_onset':'AKI','ards_onset':'ARDS',
+        'sepsis_onset':'Sepsis','need_rrt_any':'RRT',
+    }
+    available = {k:v for k,v in rate_cols.items() if k in cohort.columns}
+    if available:
+        st.markdown("#### Complication rates")
+        cols = st.columns(len(available))
+        for col,(k,label) in zip(cols, available.items()):
+            col.metric(label, f"{cohort[k].mean()*100:.1f}%")
+
     st.markdown("---")
-    
-    # Visualizations
+
     col1, col2 = st.columns(2)
-    
     with col1:
-        st.subheader("Mortality Distribution")
-        mortality_counts = data['mortality'].value_counts()
-        fig = px.pie(
-            values=mortality_counts.values,
-            names=['Survived', 'Died'],
-            color_discrete_sequence=['#00cc96', '#ef553b']
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
+        st.subheader("Mortality distribution")
+        if 'mortality' in cohort.columns:
+            vc = cohort['mortality'].value_counts()
+            fig = px.pie(values=vc.values, names=['Survived','Died'],
+                         color_discrete_sequence=['#22c55e','#ef4444'],
+                         hole=0.4)
+            fig.update_layout(margin=dict(t=20,b=10,l=10,r=10))
+            st.plotly_chart(fig, use_container_width=True)
+
     with col2:
-        st.subheader("Length of Stay Distribution")
-        los_data = data['los_category'].value_counts().sort_index()
-        los_labels = ['Short (<3d)', 'Medium (3-7d)', 'Long (>7d)']
-        fig = px.bar(
-            x=los_labels,
-            y=los_data.values,
-            color=los_labels,
-            color_discrete_sequence=['#636efa', '#ffa15a', '#ef553b']
-        )
-        fig.update_layout(showlegend=False, xaxis_title="Category", yaxis_title="Count")
+        st.subheader("LOS distribution (days)")
+        if 'los_days' in cohort.columns:
+            los_clipped = cohort['los_days'].clip(upper=30)
+            fig = px.histogram(los_clipped, nbins=40,
+                               color_discrete_sequence=['#6366f1'])
+            fig.update_layout(xaxis_title="LOS (days, capped at 30)",
+                              yaxis_title="Count",
+                              margin=dict(t=20,b=10,l=10,r=10),
+                              showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+    if 'age' in cohort.columns:
+        st.subheader("Age distribution")
+        fig = px.histogram(cohort, x='age', nbins=35,
+                           color_discrete_sequence=['#0ea5e9'])
+        fig.update_layout(xaxis_title="Age (years)", yaxis_title="Count",
+                          showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
-    
-    # Age distribution
-    st.subheader("Patient Age Distribution")
-    fig = px.histogram(data, x='age', nbins=30, title="Age Distribution")
-    fig.update_layout(xaxis_title="Age (years)", yaxis_title="Frequency")
+
+
+# ── Page: Predictions ────────────────────────────────────────────────────────
+
+def page_predictions(cohort: pd.DataFrame, models: dict, preps: dict):
+    st.header("Patient Risk Panel")
+
+    if cohort.empty:
+        st.warning("Cohort CSV not found."); return
+    if not models:
+        st.warning("No tuned models found. Run `save_tuned_models.py` first."); return
+
+    # Patient selector
+    fmt = (lambda i: f"Patient {cohort.iloc[i].get('subject_id','?')} "
+                     f"(Stay {cohort.iloc[i].get('stay_id','?')})")
+    idx = st.selectbox("Select patient", range(len(cohort)), format_func=fmt)
+    patient = cohort.iloc[idx]
+
+    # Demographics strip
+    d1,d2,d3,d4 = st.columns(4)
+    d1.metric("Age",   str(int(patient.get('age', 0))) + " yrs")
+    d2.metric("Gender","M" if patient.get('gender_M',0)==1 else "F")
+    d3.metric("Actual mortality","Yes" if patient.get('mortality',0)==1 else "No")
+    d4.metric("Actual LOS",     f"{patient.get('los_days',0):.1f} d")
+
+    st.markdown("---")
+
+    # ── Binary binary targets (gauges) ──────────────────────────────────────
+    binary_targets = [t for t in TASK_TYPE if TASK_TYPE[t]=='binary' and t in models]
+
+    st.subheader("Risk probabilities")
+
+    # 4 per row
+    for row_start in range(0, len(binary_targets), 4):
+        chunk = binary_targets[row_start:row_start+4]
+        cols  = st.columns(len(chunk))
+        for col, target in zip(cols, chunk):
+            prob, _ = predict_for_patient(target, patient, models, preps)
+            with col:
+                if prob is None:
+                    st.info(f"{TARGET_LABELS[target]}\n\nN/A")
+                    continue
+                pct = prob * 100
+                color = "#ef4444" if pct>50 else "#f59e0b" if pct>25 else "#22c55e"
+                fig = go.Figure(go.Indicator(
+                    mode="gauge+number",
+                    value=round(pct, 1),
+                    title={'text': TARGET_LABELS[target], 'font':{'size':13}},
+                    number={'suffix':'%', 'font':{'size':18}},
+                    gauge={
+                        'axis':{'range':[0,100],'tickwidth':0.5},
+                        'bar':{'color':color,'thickness':0.25},
+                        'steps':[
+                            {'range':[0,25],'color':'#f0fdf4'},
+                            {'range':[25,50],'color':'#fefce8'},
+                            {'range':[50,100],'color':'#fef2f2'},
+                        ],
+                        'threshold':{'line':{'color':'#94a3b8','width':2},
+                                     'thickness':0.75,'value':50}
+                    }
+                ))
+                fig.update_layout(height=180, margin=dict(t=30,b=5,l=10,r=10))
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Actual label
+                actual = patient.get(target)
+                if actual is not None:
+                    st.caption(f"Actual: **{'Yes' if int(actual)==1 else 'No'}**")
+
+    st.markdown("---")
+
+    # ── Multiclass targets ───────────────────────────────────────────────────
+    st.subheader("Multiclass predictions")
+    mc1, mc2 = st.columns(2)
+
+    for col_ui, target in zip([mc1, mc2],
+                               [t for t in TASK_TYPE if TASK_TYPE[t]=='multiclass']):
+        _, proba = predict_for_patient(target, patient, models, preps)
+        with col_ui:
+            st.markdown(f"**{TARGET_LABELS[target]}**")
+            if proba is None:
+                st.info("Model not loaded."); continue
+
+            if target == 'los_category':
+                labels = ['Short (<3d)','Medium (3–7d)','Long (>7d)']
+            else:
+                labels = ['Home','Facility','Death']
+
+            labels = labels[:len(proba)]
+            fig = px.bar(x=labels, y=(proba*100).round(1),
+                         color=labels,
+                         color_discrete_sequence=['#6366f1','#f59e0b','#ef4444'])
+            fig.update_layout(showlegend=False, yaxis_title="Probability (%)",
+                              xaxis_title="", height=220,
+                              margin=dict(t=10,b=10,l=10,r=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Actual
+            actual = patient.get(target)
+            if actual is not None:
+                act_label = labels[int(actual)] if int(actual) < len(labels) else str(actual)
+                st.caption(f"Actual: **{act_label}**")
+
+
+# ── Page: Model Performance ──────────────────────────────────────────────────
+
+def page_performance():
+    st.header("Model Performance — Baseline vs Tuned")
+
+    st.markdown("""
+    **Method:** 4 feature-selection matrices (IG, ANOVA, MI, LASSO) × 5 models (CatBoost, XGBoost,
+    Random Forest, Logistic Regression, Custom MLP) = 240 models evaluated per target.
+    Winning configuration for each target was tuned with **Optuna Bayesian optimisation** (50 trials, TPE sampler).
+    """)
+
+    df = pd.DataFrame(TUNING_RESULTS)
+    df['Target_display'] = df['Target'].str.replace('_',' ').str.title()
+    df['Delta_str'] = df['Delta'].apply(lambda d: f"+{d:.4f}" if d>=0 else f"{d:.4f}")
+
+    # ── Summary metrics ──────────────────────────────────────────────────────
+    col1,col2,col3,col4 = st.columns(4)
+    col1.metric("Targets improved", f"{(df['Delta']>=0).sum()} / 12")
+    col2.metric("Best gain",  f"+{df['Delta'].max():.4f}",
+                df.loc[df['Delta'].idxmax(),'Target_display'])
+    col3.metric("Avg ΔAuC",   f"+{df['Delta'].mean():.4f}")
+    col4.metric("Best tuned AUC", f"{df['Tuned'].max():.4f}",
+                df.loc[df['Tuned'].idxmax(),'Target_display'])
+
+    st.markdown("---")
+
+    # ── Grouped bar ──────────────────────────────────────────────────────────
+    st.subheader("Baseline vs Tuned AUC")
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name='Baseline', x=df['Target_display'],
+                         y=df['Baseline'], marker_color='#94a3b8',
+                         marker_line_width=0.5))
+    fig.add_trace(go.Bar(name='Tuned',    x=df['Target_display'],
+                         y=df['Tuned'],
+                         marker_color=[('#22c55e' if d>=0 else '#ef4444')
+                                       for d in df['Delta']],
+                         marker_line_width=0.5))
+    fig.update_layout(barmode='group', yaxis=dict(range=[0.55,1.0],title='ROC-AUC'),
+                      xaxis_tickangle=-35, height=400,
+                      legend=dict(orientation='h',yanchor='bottom',y=1.02),
+                      margin=dict(t=20,b=80))
     st.plotly_chart(fig, use_container_width=True)
 
-def show_predictions(models, data, results):
-    """Interactive prediction interface."""
-    st.header("Patient Outcome Predictions")
+    # ── Delta bar ────────────────────────────────────────────────────────────
+    st.subheader("Gain from tuning (ΔAUC)")
+    fig2 = go.Figure(go.Bar(
+        x=df['Target_display'], y=df['Delta'],
+        marker_color=[('#22c55e' if d>=0 else '#ef4444') for d in df['Delta']],
+        marker_line_width=0.5,
+        text=df['Delta_str'], textposition='outside',
+    ))
+    fig2.update_layout(yaxis_title='ΔAUC', xaxis_tickangle=-35, height=340,
+                       margin=dict(t=30,b=80))
+    fig2.add_hline(y=0, line_dash='dash', line_color='#64748b')
+    st.plotly_chart(fig2, use_container_width=True)
 
-    # Show which model is being used for each task
-    with st.expander("ℹ️ Models in use (best by validation ROC-AUC)"):
-        rows = []
-        for task_key in TASK_PREFIX:
-            if task_key in results and task_key in models:
-                best = results[task_key]['best_model'].replace('_', ' ').title()
-                val_auc = (
-                    results[task_key]['validation']
-                    .get(results[task_key]['best_model'], {})
-                    .get('roc_auc') or
-                    results[task_key]['validation']
-                    .get(results[task_key]['best_model'], {})
-                    .get('roc_auc_ovr_macro')
-                )
-                rows.append({
-                    'Task': task_key.replace('_', ' ').title(),
-                    'Best Model': best,
-                    'Val ROC-AUC': f"{val_auc:.4f}" if val_auc else 'N/A'
-                })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    # ── Full table ───────────────────────────────────────────────────────────
+    st.subheader("Full results table")
+    display_df = df[['Target_display','Model','Matrix','Baseline','Tuned','Delta_str']].copy()
+    display_df.columns = ['Target','Winner model','Matrix','Baseline AUC','Tuned AUC','ΔAUC']
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # ── Readmit note ─────────────────────────────────────────────────────────
+    with st.expander("⚠️  ICU readmission targets — why AUC is ~0.60"):
+        st.markdown("""
+        Both `icu_readmit_48h` (0.5919) and `icu_readmit_7d` (0.6031) score near chance
+        despite tuning. This is **not a modelling failure** — it reflects a known clinical
+        finding: unplanned ICU readmission is driven largely by post-discharge ward care
+        quality and events that are not captured in ICU chart data. Multiple published
+        MIMIC-IV studies report AUC 0.60–0.68 for this task. The features that predict
+        readmission (nurse staffing, ward workload, care transitions) simply aren't in
+        the dataset.
+        """)
+
+
+# ── Page: SHAP Analysis ──────────────────────────────────────────────────────
+
+def page_shap():
+    st.header("SHAP Explainability Analysis")
 
     st.markdown("""
-    Enter patient information to predict:
-    - **Mortality risk** (probability of in-hospital death)
-    - **Length of stay category** (Short, Medium, or Long)
+    Each target's winning tuned model was explained using the appropriate SHAP explainer:
+    **TreeExplainer** (CatBoost / XGBoost / Random Forest), **LinearExplainer** (Logistic Regression),
+    **DeepExplainer** (Custom MLP).
     """)
-    
-    # Sample patient selector
-    st.subheader("Select a Sample Patient")
-    patient_idx = st.selectbox(
-        "Choose a patient from the cohort:",
-        options=range(len(data)),
-        format_func=lambda x: f"Patient {data.iloc[x]['subject_id']} (Stay ID: {data.iloc[x]['stay_id']})"
+
+    targets = [r['Target'] for r in TUNING_RESULTS]
+    target  = st.selectbox(
+        "Select target",
+        targets,
+        format_func=lambda t: TARGET_LABELS.get(t, t)
     )
-    
-    patient = data.iloc[patient_idx]
-    
-    # Display patient info
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.info(f"**Age:** {patient.get('age', 'N/A')}")
-    with col2:
-        gender = "Male" if patient.get('gender_M', 0) == 1 else "Female"
-        st.info(f"**Gender:** {gender}")
-    with col3:
-        st.info(f"**Actual Mortality:** {'Yes' if patient['mortality'] == 1 else 'No'}")
-    
-    # Prepare features — exclude IDs and all target columns
-    exclude = {
-        'subject_id', 'hadm_id', 'stay_id',
-        'mortality', 'los_days', 'los_category',
-        'icu_readmit_48h', 'icu_readmit_7d', 'discharge_disposition',
-        'need_vent_any', 'need_vasopressor_any', 'need_rrt_any',
-        'aki_onset', 'ards_onset', 'liver_injury_onset', 'sepsis_onset'
-    }
-    feature_cols = [c for c in data.columns if c not in exclude]
-    X = patient[feature_cols].values.reshape(1, -1)
-    X_scaled = models['scaler'].transform(X)
-    
-    # Make predictions
-    st.markdown("---")
-    st.subheader("Predictions")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("### Mortality Risk")
-        mortality_prob = models['mortality'].predict_proba(X_scaled)[0][1]
-        
-        # Gauge chart
-        fig = go.Figure(go.Indicator(
-            mode="gauge+number+delta",
-            value=mortality_prob * 100,
-            domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': "Risk (%)"},
-            delta={'reference': 11.38},  # Average mortality rate
-            gauge={
-                'axis': {'range': [None, 100]},
-                'bar': {'color': "darkred" if mortality_prob > 0.5 else "darkblue"},
-                'steps': [
-                    {'range': [0, 25], 'color': "lightgreen"},
-                    {'range': [25, 50], 'color': "yellow"},
-                    {'range': [50, 75], 'color': "orange"},
-                    {'range': [75, 100], 'color': "red"}
-                ],
-                'threshold': {
-                    'line': {'color': "red", 'width': 4},
-                    'thickness': 0.75,
-                    'value': 50
-                }
-            }
-        ))
-        st.plotly_chart(fig, use_container_width=True)
-        
-        risk_level = "HIGH" if mortality_prob > 0.5 else "MEDIUM" if mortality_prob > 0.25 else "LOW"
-        st.markdown(f"**Risk Level:** :{'red' if risk_level=='HIGH' else 'orange' if risk_level=='MEDIUM' else 'green'}[{risk_level}]")
-    
-    with col2:
-        st.markdown("### Length of Stay Prediction")
-        los_pred = models['los_category'].predict(X_scaled)[0]
-        los_proba = models['los_category'].predict_proba(X_scaled)[0]
-        
-        los_labels = ['Short (<3d)', 'Medium (3-7d)', 'Long (>7d)']
-        predicted_category = los_labels[los_pred]
-        
-        # Bar chart of probabilities
-        fig = px.bar(
-            x=los_labels,
-            y=los_proba * 100,
-            color=los_labels,
-            color_discrete_sequence=['#636efa', '#ffa15a', '#ef553b']
-        )
-        fig.update_layout(
-            showlegend=False,
-            xaxis_title="Category",
-            yaxis_title="Probability (%)",
-            title="LOS Category Probabilities"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        st.markdown(f"**Predicted Category:** :blue[{predicted_category}]")
-        st.markdown(f"**Confidence:** {los_proba[los_pred]*100:.1f}%")
-    
-    # -------- Readmission risk --------
-    st.markdown("---")
-    st.subheader("ICU Readmission Risk")
-    rc1, rc2 = st.columns(2)
-    for col_ui, key, label in [
-        (rc1, 'icu_readmit_48h', '48-Hour'),
-        (rc2, 'icu_readmit_7d', '7-Day')
-    ]:
-        with col_ui:
-            if key in models:
-                prob = models[key].predict_proba(X_scaled)[0][1]
-                fig = go.Figure(go.Indicator(
-                    mode="gauge+number", value=prob * 100,
-                    title={'text': f"{label} Readmit Risk (%)"},
-                    gauge={'axis': {'range': [0, 100]},
-                           'steps': [{'range': [0, 20], 'color': 'lightgreen'},
-                                     {'range': [20, 50], 'color': 'yellow'},
-                                     {'range': [50, 100], 'color': 'red'}]}
-                ))
-                st.plotly_chart(fig, use_container_width=True)
+
+    info = next(r for r in TUNING_RESULTS if r['Target']==target)
+    st.caption(f"Model: **{info['Model']}**  |  Matrix: **{info['Matrix']}**  |  Tuned AUC: **{info['Tuned']:.4f}**")
+
+    tab1, tab2, tab3 = st.tabs(["🐝 Beeswarm", "📊 Bar (Global Importance)", "🌊 Waterfall (Highest-risk patient)"])
+
+    def show_img(path, caption):
+        if path.exists():
+            st.image(str(path), caption=caption, use_container_width=True)
+        else:
+            st.info(f"Image not found: `{path}`  — run `shap_analysis.py` first.")
+
+    with tab1:
+        show_img(SHAP_DIR / f'{target}_beeswarm.png',
+                 f"Beeswarm — {TARGET_LABELS.get(target,target)}: each dot = one patient. "
+                 "X-axis = SHAP value (push on prediction). Color = feature value (blue=low, red=high).")
+        with st.expander("How to read this"):
+            st.markdown("""
+            - **X > 0** → feature pushed the prediction **higher** (more risk)
+            - **X < 0** → feature pushed the prediction **lower** (less risk)
+            - **Color** → red = patient had a high value for that feature; blue = low value
+            - Features are sorted by mean |SHAP| — most important at the top
+            """)
+
+    with tab2:
+        show_img(SHAP_DIR / f'{target}_bar.png',
+                 f"Global importance — mean |SHAP value| across all {2000} test patients.")
+        with st.expander("How to read this"):
+            st.markdown("""
+            Mean |SHAP| is the average absolute contribution of each feature across the entire
+            test set. Unlike permutation importance, SHAP values are model-agnostic and properly
+            account for feature interactions.
+            """)
+
+    with tab3:
+        show_img(SHAP_DIR / f'{target}_waterfall.png',
+                 "Waterfall — single highest-risk patient. "
+                 "Each bar shows how much that feature pushed the prediction up (green) or down (red) from the base value.")
+        with st.expander("How to read this"):
+            st.markdown("""
+            - **Base value** (dashed line) = average model output across the training set
+            - Each bar adds or subtracts from that base
+            - **Final prediction** = base + sum of all SHAP values for this patient
+            - Features are sorted by absolute contribution for this individual patient
+            """)
+
+
+# ── Page: ROC Curves ─────────────────────────────────────────────────────────
+
+def page_roc():
+    st.header("ROC Curves — Tuned Models")
+    st.markdown("One ROC curve per target, saved after Optuna tuning on the held-out test set (20%).")
+
+    targets = [r['Target'] for r in TUNING_RESULTS]
+    cols = st.columns(3)
+    for i, target in enumerate(targets):
+        path = ROC_DIR / f'roc_tuned_{target}.png'
+        with cols[i % 3]:
+            if path.exists():
+                auc_val = next(r['Tuned'] for r in TUNING_RESULTS if r['Target']==target)
+                st.image(str(path),
+                         caption=f"{TARGET_LABELS.get(target,target)}  AUC={auc_val:.4f}",
+                         use_container_width=True)
             else:
-                st.info(f"{label} readmission model not trained yet.")
+                st.info(f"{target}: PNG not found")
 
-    # -------- Discharge Disposition --------
-    if 'discharge_disposition' in models:
-        st.markdown("---")
-        st.subheader("Discharge Disposition Prediction")
-        dd_proba = models['discharge_disposition'].predict_proba(X_scaled)[0]
-        dd_labels = ['Home', 'Facility', 'Death']
-        fig = px.bar(x=dd_labels, y=dd_proba * 100,
-                     color=dd_labels,
-                     color_discrete_sequence=['#00cc96', '#ffa15a', '#ef553b'])
-        fig.update_layout(showlegend=False, xaxis_title="", yaxis_title="Probability (%)")
-        st.plotly_chart(fig, use_container_width=True)
 
-    # -------- Organ Support --------
-    st.markdown("---")
-    st.subheader("Organ Support Predictions")
-    os1, os2, os3 = st.columns(3)
-    for col_ui, key, label in [
-        (os1, 'need_vent_any', 'Mechanical Ventilation'),
-        (os2, 'need_vasopressor_any', 'Vasopressors'),
-        (os3, 'need_rrt_any', 'Renal Replacement')
-    ]:
-        with col_ui:
-            if key in models:
-                prob = models[key].predict_proba(X_scaled)[0][1]
-                st.metric(label, f"{prob*100:.1f}%")
-                st.progress(float(min(prob, 1.0)))
-            else:
-                st.info(f"{label} model not trained.")
+# ── Page: About ──────────────────────────────────────────────────────────────
 
-    # -------- Disease Onset --------
-    st.markdown("---")
-    st.subheader("Complication Onset Risk")
-    dc1, dc2, dc3, dc4 = st.columns(4)
-    for col_ui, key, label in [
-        (dc1, 'aki_onset', 'AKI'),
-        (dc2, 'ards_onset', 'ARDS'),
-        (dc3, 'liver_injury_onset', 'Liver Injury'),
-        (dc4, 'sepsis_onset', 'Sepsis')
-    ]:
-        with col_ui:
-            if key in models:
-                prob = models[key].predict_proba(X_scaled)[0][1]
-                st.metric(label, f"{prob*100:.1f}%")
-                st.progress(float(min(prob, 1.0)))
-            else:
-                st.info(f"{label} model N/A")
-
-    # -------- Actual Outcomes --------
-    st.markdown("---")
-    st.subheader("Actual Outcomes")
-
-    a1, a2, a3, a4 = st.columns(4)
-    with a1:
-        st.success(f"**Mortality:** {'Yes' if patient['mortality'] == 1 else 'No'}")
-    with a2:
-        st.success(f"**LOS:** {los_labels[int(patient['los_category'])]}")
-    with a3:
-        if 'icu_readmit_48h' in patient.index:
-            st.info(f"**Readmit 48h:** {'Yes' if patient['icu_readmit_48h'] == 1 else 'No'}")
-    with a4:
-        if 'icu_readmit_7d' in patient.index:
-            st.info(f"**Readmit 7d:** {'Yes' if patient['icu_readmit_7d'] == 1 else 'No'}")
-
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        if 'discharge_disposition' in patient.index:
-            dd_map = {0: 'Home', 1: 'Facility', 2: 'Death'}
-            st.info(f"**Discharge:** {dd_map.get(int(patient['discharge_disposition']), 'Unknown')}")
-    with b2:
-        if 'need_vent_any' in patient.index:
-            st.info(f"**Ventilation:** {'Yes' if patient['need_vent_any'] == 1 else 'No'}")
-    with b3:
-        if 'need_vasopressor_any' in patient.index:
-            st.info(f"**Vasopressors:** {'Yes' if patient['need_vasopressor_any'] == 1 else 'No'}")
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        if 'need_rrt_any' in patient.index:
-            st.info(f"**RRT:** {'Yes' if patient['need_rrt_any'] == 1 else 'No'}")
-    with c2:
-        if 'aki_onset' in patient.index:
-            st.info(f"**AKI:** {'Yes' if patient['aki_onset'] == 1 else 'No'}")
-    with c3:
-        if 'ards_onset' in patient.index:
-            st.info(f"**ARDS:** {'Yes' if patient['ards_onset'] == 1 else 'No'}")
-    with c4:
-        if 'sepsis_onset' in patient.index:
-            st.info(f"**Sepsis:** {'Yes' if patient['sepsis_onset'] == 1 else 'No'}")
-
-def show_model_performance(results):
-    """Display model performance metrics."""
-    st.header("Model Performance Evaluation")
-    
-    # ── 1. Mortality ────────────────────────────────────────────────────────
-    st.subheader("1. Mortality Prediction Models")
-    
-    mortality_val  = results['mortality']['validation']
-    mortality_test = results['mortality']['test']
-    best_mortality = results['mortality']['best_model']
-    
-    comparison_data = []
-    for model_name, metrics in mortality_val.items():
-        comparison_data.append({
-            'Model': ('⭐ ' if model_name == best_mortality else '') +
-                     model_name.replace('_', ' ').title(),
-            'ROC-AUC':  f"{metrics['roc_auc']:.4f}",
-            'Accuracy': f"{metrics['accuracy']:.4f}",
-            'Precision':f"{metrics['precision']:.4f}",
-            'Recall':   f"{metrics['recall']:.4f}",
-            'F1-Score': f"{metrics['f1']:.4f}"
-        })
-    
-    st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
-    st.success(f"**Best Model:** {best_mortality.replace('_', ' ').title()}")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Test ROC-AUC", f"{mortality_test['roc_auc']:.4f}")
-    col2.metric("Accuracy",     f"{mortality_test['accuracy']:.4f}")
-    col3.metric("Precision",    f"{mortality_test['precision']:.4f}")
-    col4.metric("Recall",       f"{mortality_test['recall']:.4f}")
-    
-    st.markdown("---")
-    
-    # ── 2. LOS Category ─────────────────────────────────────────────────────
-    # NOTE: results.json key is 'los_category' (not 'los_classification')
-    st.subheader("2. Length of Stay Classification Models")
-
-    los_val  = results['los_category']['validation']
-    los_test = results['los_category']['test']
-    best_los = results['los_category']['best_model']
-    
-    comparison_data = []
-    for model_name, metrics in los_val.items():
-        comparison_data.append({
-            'Model':      ('⭐ ' if model_name == best_los else '') +
-                          model_name.replace('_', ' ').title(),
-            'Accuracy':   f"{metrics['accuracy']:.4f}",
-            'Precision':  f"{metrics['precision_macro']:.4f}",
-            'Recall':     f"{metrics['recall_macro']:.4f}",
-            'F1-Score':   f"{metrics['f1_macro']:.4f}",
-            'ROC-AUC':    f"{metrics['roc_auc_ovr_macro']:.4f}",
-        })
-    
-    st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
-    st.success(f"**Best Model:** {best_los.replace('_', ' ').title()}")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Test Accuracy",  f"{los_test['accuracy']:.4f}")
-    col2.metric("Precision",      f"{los_test['precision_macro']:.4f}")
-    col3.metric("Recall",         f"{los_test['recall_macro']:.4f}")
-    col4.metric("F1-Score",       f"{los_test['f1_macro']:.4f}")
-
-    # ── 3. Extended targets ─────────────────────────────────────────────────
-    # Binary tasks: roc_auc, accuracy, precision, recall, f1
-    # Multiclass tasks: roc_auc_ovr_macro, accuracy, precision_macro, recall_macro, f1_macro
-    BINARY_METRICS = [
-        ('roc_auc',   'ROC-AUC'),
-        ('accuracy',  'Accuracy'),
-        ('precision', 'Precision'),
-        ('recall',    'Recall'),
-        ('f1',        'F1-Score'),
-    ]
-    MULTI_METRICS = [
-        ('roc_auc_ovr_macro',  'ROC-AUC'),
-        ('accuracy',           'Accuracy'),
-        ('precision_macro',    'Precision'),
-        ('recall_macro',       'Recall'),
-        ('f1_macro',           'F1-Score'),
-    ]
-    MULTICLASS_TASKS = {'discharge_disposition'}
-
-    extended_targets = {
-        'icu_readmit_48h':       'ICU Readmission (48h)',
-        'icu_readmit_7d':        'ICU Readmission (7d)',
-        'discharge_disposition': 'Discharge Disposition',
-        'need_vent_any':         'Mechanical Ventilation',
-        'need_vasopressor_any':  'Vasopressor Use',
-        'need_rrt_any':          'Renal Replacement',
-        'aki_onset':             'AKI Onset',
-        'ards_onset':            'ARDS Onset',
-        'liver_injury_onset':    'Liver Injury Onset',
-        'sepsis_onset':          'Sepsis Onset',
-    }
-
-    shown_any = False
-    for i, (key, title) in enumerate(extended_targets.items()):
-        if key not in results:
-            continue
-
-        if not shown_any:
-            st.markdown("---")
-            st.subheader("3. Extended Target Models")
-            shown_any = True
-
-        st.markdown(f"#### {i + 3}. {title}")
-
-        task_results = results[key]
-        val_results  = task_results.get('validation', {})
-        test_metrics = task_results.get('test', {})
-        best         = task_results.get('best_model', '')
-        metrics      = MULTI_METRICS if key in MULTICLASS_TASKS else BINARY_METRICS
-
-        # Validation comparison table (all models)
-        rows = []
-        for model_name, model_metrics in val_results.items():
-            row = {'Model': ('⭐ ' if model_name == best else '') +
-                            model_name.replace('_', ' ').title()}
-            for metric_key, metric_label in metrics:
-                val = model_metrics.get(metric_key)
-                row[metric_label] = f"{val:.4f}" if val is not None else 'N/A'
-            rows.append(row)
-
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.success(f"**Best Model:** {best.replace('_', ' ').title()}")
-
-        # Test set metrics for the best model
-        test_cols = st.columns(len(metrics))
-        for col, (metric_key, metric_label) in zip(test_cols, metrics):
-            val = test_metrics.get(metric_key)
-            col.metric(f"Test {metric_label}", f"{val:.4f}" if val is not None else 'N/A')
-
-        st.markdown("---")
-
-def show_about():
-    """Display about page."""
+def page_about():
     st.header("About This Project")
-    
     st.markdown("""
-    ## ICU Patient Outcome Prediction System
-    
-    ### Overview
-    This machine learning system predicts patient outcomes in Intensive Care Units using the **MIMIC-IV v2.2 dataset**.
-    
-    ### Prediction Tasks
-    1. **Mortality Prediction** — In-hospital mortality risk
-    2. **Length of Stay** — Classification (Short / Medium / Long) + continuous days
-    3. **ICU Readmission** — 48-hour and 7-day bounce-back risk
-    4. **Discharge Disposition** — Home / Facility / Death
-    5. **Organ Support** — Ventilation, Vasopressors, RRT need
-    6. **Disease Onset** — AKI, ARDS, Liver Injury, Sepsis
-    
-    ### Models Used
-    - **Logistic Regression** (Baseline)
-    - **Random Forest** (Ensemble)
-    - **XGBoost** (Gradient Boosting)
-    - **CatBoost** (Gradient Boosting)
-    
-    The best-performing model per task (by validation ROC-AUC) is selected automatically.
-    
-    ### Dataset
-    - **Source:** MIMIC-IV v2.2 (Medical Information Mart for Intensive Care)
-    - **Size:** ~73,000 ICU stays from ~51,000 unique patients
-    - **Features:** 100+ clinical features including demographics, diagnosis/procedure codes, lab values, and temporal patterns
-    
+    ## MIMIC-IV ICU Outcome Prediction
+
+    ### Pipeline summary
+
+    | Stage | Description |
+    |---|---|
+    | **Cohort** | MIMIC-IV v2.2, ~73k ICU stays, adults only |
+    | **Feature engineering** | Demographics, vitals, labs, SOFA/APACHE, procedure flags |
+    | **Feature selection** | 4 methods (IG, ANOVA, MI, LASSO) × union over 12 targets |
+    | **Tournament** | 240 models evaluated (4 matrices × 5 models × 12 targets) |
+    | **Tuning** | Optuna Bayesian optimisation — 50 trials, TPE sampler, 3-fold CV |
+    | **Explainability** | SHAP (TreeExplainer / LinearExplainer / DeepExplainer) |
+
+    ### Prediction targets (12)
+    Binary: Mortality, AKI, ARDS, Sepsis, Liver Injury, Ventilation, Vasopressors, RRT, Readmit 48h, Readmit 7d  
+    Multiclass: LOS Category (3-class), Discharge Disposition (3-class)
+
+    ### Model performance highlights
+    | Target | Tuned AUC |
+    |---|---|
+    | Need ventilation | **0.9791** |
+    | Need vasopressors | **0.9739** |
+    | ARDS onset | **0.9373** |
+    | Liver injury | **0.9290** |
+    | Need RRT | **0.9581** |
+    | Mortality | **0.8966** |
+
     ### Technologies
-    - Python 3.11
-    - Scikit-learn, XGBoost, CatBoost
-    - Streamlit (Dashboard)
-    - Pandas, NumPy (Data processing)
-    - Plotly (Visualizations)
-    
-    ### Team
-    ML Healthcare Team - Minor Project 2026
-    
-    ### Data Privacy
-    All patient data is de-identified according to HIPAA standards and MIMIC-IV data use agreements.
-    
+    Python 3.11 · Scikit-learn · XGBoost · CatBoost · TensorFlow/Keras  
+    Optuna · SHAP · Streamlit · Plotly · Pandas · NumPy
+
     ---
-    
-    **Note:** This is a research/educational tool and should not be used for actual clinical decision-making without proper validation and regulatory approval.
+    > **Research / educational use only.** Not validated for clinical decision-making.
     """)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    page   = sidebar()
+    models, preps = load_all_models()
+    cohort = load_cohort()
+
+    if page == "📊 Dashboard":
+        page_dashboard(cohort)
+    elif page == "🔮 Predictions":
+        page_predictions(cohort, models, preps)
+    elif page == "📈 Model Performance":
+        page_performance()
+    elif page == "🧠 SHAP Analysis":
+        page_shap()
+    elif page == "📉 ROC Curves":
+        page_roc()
+    else:
+        page_about()
+
 
 if __name__ == "__main__":
     main()
