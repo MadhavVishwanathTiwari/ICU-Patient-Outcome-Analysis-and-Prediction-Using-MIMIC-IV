@@ -47,6 +47,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
 import xgboost as xgb
 from catboost import CatBoostClassifier
 
@@ -168,10 +169,16 @@ def build_catboost(params, task_type, n_classes):
     return CatBoostClassifier(**p)
 
 
-def build_xgboost(params, task_type, n_classes):
+def build_xgboost(params, task_type, n_classes, y_train):
     p = dict(params, random_state=42, n_jobs=-1, use_label_encoder=False)
     if task_type == 'binary':
         p['eval_metric'] = 'logloss'
+        
+        # --- FIX: Calculate and apply scale_pos_weight ---
+        neg = np.sum(y_train == 0)
+        pos = np.sum(y_train == 1)
+        p['scale_pos_weight'] = neg / pos if pos > 0 else 1.0
+        
     else:
         p.update({'eval_metric': 'mlogloss', 'objective': 'multi:softprob',
                   'num_class': n_classes})
@@ -219,8 +226,15 @@ def train_model(model_name, params, task_type, n_classes,
         return m, False
 
     elif model_name == 'XGBoost':
-        m = build_xgboost(params, task_type, n_classes)
-        m.fit(X_train.values, y_train)
+        # FIX 1: Pass y_train to calculate scale_pos_weight
+        m = build_xgboost(params, task_type, n_classes, y_train)
+        
+        # FIX 2: Multiclass sample weighting
+        if task_type == 'multiclass':
+            weights = compute_sample_weight('balanced', y_train)
+            m.fit(X_train.values, y_train, sample_weight=weights)
+        else:
+            m.fit(X_train.values, y_train)
         return m, False
 
     elif model_name == 'Random Forest':
@@ -234,13 +248,19 @@ def train_model(model_name, params, task_type, n_classes,
         return m, False
 
     elif model_name == 'Custom MLP':
+        # FIX 3: Add Keras class_weights to match the tournament script
+        classes = np.unique(y_train)
+        weights = compute_class_weight('balanced', classes=classes, y=y_train)
+        cw = dict(zip(classes, weights))
+
         val_n = int(0.15 * len(X_train))
         X_tr2, X_val2 = X_train.values[:-val_n], X_train.values[-val_n:]
         y_tr2, y_val2 = y_train[:-val_n], y_train[-val_n:]
         m = build_mlp(params, X_train.shape[1], task_type, n_classes)
         cb = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
         m.fit(X_tr2, y_tr2, epochs=100, batch_size=params['batch_size'],
-              validation_data=(X_val2, y_val2), callbacks=[cb], verbose=0)
+              validation_data=(X_val2, y_val2), callbacks=[cb], 
+              class_weight=cw, verbose=0) # Applied class_weight here
         return m, True
 
     raise ValueError(f"Unknown model: {model_name}")

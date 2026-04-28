@@ -146,6 +146,11 @@ def objective_catboost(trial, X_train, y_train, task_type, n_classes):
     return _cv_score(CatBoostClassifier(**params), X_train, y_train, task_type)
 
 def objective_xgboost(trial, X_train, y_train, task_type, n_classes):
+    # --- ADD THIS BALANCING LOGIC ---
+    neg = np.sum(y_train == 0)
+    pos = np.sum(y_train == 1)
+    spw = neg / pos if pos > 0 else 1.0
+
     params = {
         'n_estimators':     trial.suggest_int('n_estimators', 100, 1000),
         'learning_rate':    trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
@@ -160,10 +165,13 @@ def objective_xgboost(trial, X_train, y_train, task_type, n_classes):
         'random_state': 42,
         'n_jobs': -1,
     }
+    
     if task_type == 'binary':
         params['eval_metric'] = 'logloss'
+        params['scale_pos_weight'] = spw # --- ADD SPW HERE ---
     else:
         params.update({'eval_metric': 'mlogloss', 'objective': 'multi:softprob', 'num_class': n_classes})
+        
     return _cv_score(xgb.XGBClassifier(**params), X_train, y_train, task_type)
 
 def objective_rf(trial, X_train, y_train, task_type, n_classes):
@@ -248,7 +256,13 @@ def final_evaluate(target_name, config, best_params, X_train, X_test, y_train, y
         model.fit(X_train, y_train)
 
     elif model_name == 'XGBoost':
-        model = xgb.XGBClassifier(**best_params, random_state=42, n_jobs=-1, use_label_encoder=False)
+        if task_type == 'binary':
+            neg = np.sum(y_train == 0)
+            pos = np.sum(y_train == 1)
+            spw = neg / pos if pos > 0 else 1.0
+            model = xgb.XGBClassifier(**best_params, scale_pos_weight=spw, random_state=42, n_jobs=-1, use_label_encoder=False)
+        else:
+            model = xgb.XGBClassifier(**best_params, random_state=42, n_jobs=-1, use_label_encoder=False)
         model.fit(X_train, y_train)
 
     elif model_name == 'Random Forest':
