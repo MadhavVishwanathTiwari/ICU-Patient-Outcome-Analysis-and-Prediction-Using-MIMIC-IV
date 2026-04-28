@@ -9,10 +9,15 @@ Per target, outputs (to results/shap/):
   2. <target>_bar.png        — mean |SHAP| bar chart (top-20 features, global importance)
   3. <target>_waterfall.png  — single-patient waterfall (highest-risk patient in test set)
 
-Explainer selection:
-  CatBoost / XGBoost / Random Forest → TreeExplainer  (fast, exact)
-  Logistic Regression                → LinearExplainer (fast)
-  Custom MLP                         → DeepExplainer   (fast for keras)
+Explainer selection
+-------------------
+  CatBoost / XGBoost / Random Forest  → TreeExplainer  (fast, exact)
+  Logistic Regression                 → LinearExplainer (fast)
+  Custom MLP                          → DeepExplainer   (fast for keras)
+  Stacking Ensemble                   → LinearExplainer on the meta-learner.
+      Features are the 5 base-learner OOF predictions (binary) or
+      5 × n_classes predictions (multiclass).
+      This answers "which base learner does the meta-learner trust most?"
 
 Run:
     pip install shap catboost xgboost scikit-learn tensorflow matplotlib
@@ -58,6 +63,11 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
 import tensorflow.keras.backend as K
 
+from src.models.stacking_model import (           # ← NEW
+    precompute_oof, train_meta_learner,
+    get_test_meta_features, get_oof_feature_names
+)
+
 
 # ─────────────────────────────────────────────────────────────
 # PATHS & CONSTANTS
@@ -82,25 +92,18 @@ ALL_TARGET_COLS = [
 ]
 ID_COLS = ['subject_id', 'hadm_id', 'stay_id']
 
-# Background sample size for KernelExplainer / DeepExplainer
-# Larger = more accurate but slower. 200 is a reasonable balance.
-BACKGROUND_N = 200
-
-# Max test-set rows passed to SHAP.
-# Keep higher cap for most models, but use a smaller cap for Random Forest
-# because TreeExplainer can become very slow on deep forests.
-SHAP_EXPLAIN_N = 2000
+BACKGROUND_N     = 200
+SHAP_EXPLAIN_N   = 2000
 SHAP_EXPLAIN_N_RF = 600
+TOP_N            = 20
 
-# How many top features to show in bar and beeswarm plots
-TOP_N = 20
 
 # ─────────────────────────────────────────────────────────────
 # PLOT STYLE
 # ─────────────────────────────────────────────────────────────
 
 plt.rcParams.update({
-    'font.family':   'sans-serif',
+    'font.family':        'sans-serif',
     'axes.spines.top':    False,
     'axes.spines.right':  False,
     'axes.grid':          True,
@@ -109,17 +112,17 @@ plt.rcParams.update({
 })
 
 PALETTE = {
-    'bar_fill':    '#534AB7',
-    'bar_edge':    '#3C3489',
-    'beeswarm_lo': '#3B8BD4',
-    'beeswarm_hi': '#D85A30',
+    'bar_fill':      '#534AB7',
+    'bar_edge':      '#3C3489',
+    'beeswarm_lo':   '#3B8BD4',
+    'beeswarm_hi':   '#D85A30',
     'waterfall_pos': '#1D9E75',
     'waterfall_neg': '#E24B4A',
 }
 
 
 # ─────────────────────────────────────────────────────────────
-# DATA LOADER  (mirrors tune_winners.py exactly)
+# DATA LOADER
 # ─────────────────────────────────────────────────────────────
 
 def load_data(target_name: str, matrix_name: str):
@@ -157,7 +160,7 @@ def load_data(target_name: str, matrix_name: str):
 
 
 # ─────────────────────────────────────────────────────────────
-# MODEL BUILDERS  (identical hyper-params to tune_winners.py)
+# MODEL BUILDERS
 # ─────────────────────────────────────────────────────────────
 
 def build_catboost(params, task_type, n_classes):
@@ -172,16 +175,11 @@ def build_catboost(params, task_type, n_classes):
 def build_xgboost(params, task_type, n_classes, y_train):
     p = dict(params, random_state=42, n_jobs=-1, use_label_encoder=False)
     if task_type == 'binary':
-        p['eval_metric'] = 'logloss'
-        
-        # --- FIX: Calculate and apply scale_pos_weight ---
         neg = np.sum(y_train == 0)
         pos = np.sum(y_train == 1)
-        p['scale_pos_weight'] = neg / pos if pos > 0 else 1.0
-        
+        p.update({'eval_metric': 'logloss', 'scale_pos_weight': neg / pos if pos > 0 else 1.0})
     else:
-        p.update({'eval_metric': 'mlogloss', 'objective': 'multi:softprob',
-                  'num_class': n_classes})
+        p.update({'eval_metric': 'mlogloss', 'objective': 'multi:softprob', 'num_class': n_classes})
     return xgb.XGBClassifier(**p)
 
 
@@ -205,20 +203,22 @@ def build_mlp(params, input_dim, task_type, n_classes):
     ])
     if task_type == 'binary':
         model.add(Dense(1, activation='sigmoid'))
-        model.compile(optimizer=Adam(params['lr']),
-                      loss='binary_crossentropy', metrics=['AUC'])
+        model.compile(optimizer=Adam(params['lr']), loss='binary_crossentropy', metrics=['AUC'])
     else:
         model.add(Dense(n_classes, activation='softmax'))
-        model.compile(optimizer=Adam(params['lr']),
-                      loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        model.compile(optimizer=Adam(params['lr']), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     return model
 
 
-def train_model(model_name, params, task_type, n_classes,
-                X_train, y_train):
+# ─────────────────────────────────────────────────────────────
+# TRAIN MODEL
+# ─────────────────────────────────────────────────────────────
+
+def train_model(model_name, params, task_type, n_classes, X_train, y_train):
     """
-    Trains the final model on the full training split.
     Returns (fitted_model, is_keras_model).
+    For 'Stacking Ensemble', returns (stacking_dict, False).
+    stacking_dict = {'meta': ..., 'trained_bases': ..., ...}
     """
     if model_name == 'CatBoost':
         m = build_catboost(params, task_type, n_classes)
@@ -226,10 +226,7 @@ def train_model(model_name, params, task_type, n_classes,
         return m, False
 
     elif model_name == 'XGBoost':
-        # FIX 1: Pass y_train to calculate scale_pos_weight
         m = build_xgboost(params, task_type, n_classes, y_train)
-        
-        # FIX 2: Multiclass sample weighting
         if task_type == 'multiclass':
             weights = compute_sample_weight('balanced', y_train)
             m.fit(X_train.values, y_train, sample_weight=weights)
@@ -248,20 +245,37 @@ def train_model(model_name, params, task_type, n_classes,
         return m, False
 
     elif model_name == 'Custom MLP':
-        # FIX 3: Add Keras class_weights to match the tournament script
         classes = np.unique(y_train)
         weights = compute_class_weight('balanced', classes=classes, y=y_train)
-        cw = dict(zip(classes, weights))
-
-        val_n = int(0.15 * len(X_train))
+        cw  = dict(zip(classes, weights))
+        val_n   = int(0.15 * len(X_train))
         X_tr2, X_val2 = X_train.values[:-val_n], X_train.values[-val_n:]
         y_tr2, y_val2 = y_train[:-val_n], y_train[-val_n:]
-        m = build_mlp(params, X_train.shape[1], task_type, n_classes)
-        cb = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+        m   = build_mlp(params, X_train.shape[1], task_type, n_classes)
+        cb  = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
         m.fit(X_tr2, y_tr2, epochs=100, batch_size=params['batch_size'],
-              validation_data=(X_val2, y_val2), callbacks=[cb], 
-              class_weight=cw, verbose=0) # Applied class_weight here
+              validation_data=(X_val2, y_val2), callbacks=[cb],
+              class_weight=cw, verbose=0)
         return m, True
+
+    elif model_name == 'Stacking Ensemble':
+        # ── NEW ──────────────────────────────────────────────────────────
+        meta_C = params.get('meta_C', 1.0)
+        oof_matrix, trained_bases, base_names = precompute_oof(
+            X_train.values, y_train, task_type, n_classes
+        )
+        meta           = train_meta_learner(oof_matrix, y_train, meta_C)
+        oof_feat_names = get_oof_feature_names(base_names, task_type, n_classes)
+        stacking_dict  = {
+            'meta':           meta,
+            'trained_bases':  trained_bases,
+            'base_names':     base_names,
+            'oof_feat_names': oof_feat_names,
+            'oof_matrix':     oof_matrix,   # kept for LinearExplainer background
+            'task_type':      task_type,
+            'n_classes':      n_classes,
+        }
+        return stacking_dict, False
 
     raise ValueError(f"Unknown model: {model_name}")
 
@@ -270,21 +284,78 @@ def train_model(model_name, params, task_type, n_classes,
 # SHAP EXPLAINERS
 # ─────────────────────────────────────────────────────────────
 
+def get_shap_values_stacking(stacking_dict, X_test):
+    """
+    Runs LinearExplainer on the meta-learner.
+
+    The meta-learner's input space is the 5 base-learner predictions
+    (or 5 × n_classes for multiclass).  SHAP values here answer:
+    'which base learner's opinion shifted the meta-learner's output?'
+
+    Returns (shap_vals, expected_val, X_test_meta_df, y_test_cap)
+    — note: X_test_meta_df has base-learner names as column headers so
+    downstream plot functions work without modification.
+    """
+    meta           = stacking_dict['meta']
+    trained_bases  = stacking_dict['trained_bases']
+    oof_feat_names = stacking_dict['oof_feat_names']
+    oof_matrix     = stacking_dict['oof_matrix']    # used as background
+    task_type      = stacking_dict['task_type']
+    n_classes      = stacking_dict['n_classes']
+
+    # Build test meta-features
+    test_meta_np = get_test_meta_features(trained_bases, X_test.values, task_type, n_classes)
+    test_meta_df = pd.DataFrame(test_meta_np, columns=oof_feat_names)
+
+    # Background = OOF matrix (all training rows available, no sampling needed
+    # because the meta-feature space is tiny: 5 or 5*C columns)
+    bg_df = pd.DataFrame(oof_matrix, columns=oof_feat_names)
+
+    explainer = shap.LinearExplainer(meta, bg_df, feature_perturbation='interventional')
+    sv        = explainer.shap_values(test_meta_df)
+
+    # Collapse multi-output to most informative class (mirrors existing logic)
+    if isinstance(sv, list):
+        mean_abs = [np.abs(s).mean() for s in sv]
+        best_cls = int(np.argmax(mean_abs))
+        shap_vals = sv[best_cls]
+        expected  = (explainer.expected_value[best_cls]
+                     if hasattr(explainer.expected_value, '__len__')
+                     else float(explainer.expected_value))
+    else:
+        sv_arr = np.asarray(sv)
+        if sv_arr.ndim == 3:
+            mean_abs  = np.abs(sv_arr).mean(axis=(0, 1))
+            best_cls  = int(np.argmax(mean_abs))
+            shap_vals = sv_arr[:, :, best_cls]
+            expected  = (explainer.expected_value[best_cls]
+                         if hasattr(explainer.expected_value, '__len__')
+                         else float(explainer.expected_value))
+        else:
+            shap_vals = sv_arr
+            expected  = float(explainer.expected_value)
+
+    return shap_vals, expected, test_meta_df
+
+
 def get_shap_values(model_name, model, is_keras, X_train, X_test, y_test,
                     task_type, n_classes):
     """
-    Returns (shap_values, expected_value, X_test_df).
-    shap_values is a 2D numpy array (n_samples × n_features).
-    For multiclass, we return the class with highest mean |SHAP| across classes.
+    Dispatcher — returns (shap_values, expected_value, X_test_df, y_test_cap).
+    shap_values is always 2D (n_samples × n_features).
     """
-    # Model-specific cap to keep runtime practical.
     explain_n = SHAP_EXPLAIN_N_RF if model_name == 'Random Forest' else SHAP_EXPLAIN_N
 
-    # Sample test set — SHAP plots remain representative with this cap.
     if len(X_test) > explain_n:
         sample_idx = np.random.default_rng(42).choice(len(X_test), explain_n, replace=False)
-        X_test  = X_test.iloc[sample_idx].reset_index(drop=True)
-        y_test  = y_test[sample_idx]
+        X_test = X_test.iloc[sample_idx].reset_index(drop=True)
+        y_test = y_test[sample_idx]
+
+    # ── Stacking Ensemble — special path ─────────────────────────────────
+    if model_name == 'Stacking Ensemble':
+        shap_vals, expected, X_test_meta_df = get_shap_values_stacking(model, X_test)
+        return shap_vals, expected, X_test_meta_df, y_test
+
     bg = X_train.sample(n=min(BACKGROUND_N, len(X_train)), random_state=42)
 
     if model_name in ('CatBoost', 'XGBoost', 'Random Forest'):
@@ -292,8 +363,6 @@ def get_shap_values(model_name, model, is_keras, X_train, X_test, y_test,
         sv = explainer.shap_values(X_test)
 
         if isinstance(sv, list):
-            # multiclass → list of (n × f) arrays, one per class
-            # pick the class with highest mean |SHAP| — most informative
             mean_abs = [np.abs(s).mean() for s in sv]
             best_cls = int(np.argmax(mean_abs))
             shap_vals = sv[best_cls]
@@ -301,10 +370,6 @@ def get_shap_values(model_name, model, is_keras, X_train, X_test, y_test,
                          if hasattr(explainer.expected_value, '__len__')
                          else explainer.expected_value)
         else:
-            # Newer SHAP versions may return ndarray with class axis:
-            #   binary    -> (n, f, 2)
-            #   multiclass-> (n, f, c)
-            # We collapse to one class so downstream plotting always gets (n, f).
             sv_arr = np.asarray(sv)
             if sv_arr.ndim == 3:
                 mean_abs = np.abs(sv_arr).mean(axis=(0, 1))
@@ -314,7 +379,6 @@ def get_shap_values(model_name, model, is_keras, X_train, X_test, y_test,
                              if hasattr(explainer.expected_value, '__len__')
                              else explainer.expected_value)
             else:
-                # binary legacy path -> (n, f)
                 shap_vals = sv_arr
                 expected  = (explainer.expected_value[1]
                              if hasattr(explainer.expected_value, '__len__')
@@ -332,8 +396,8 @@ def get_shap_values(model_name, model, is_keras, X_train, X_test, y_test,
         else:
             sv_arr = np.asarray(sv)
             if sv_arr.ndim == 3:
-                mean_abs = np.abs(sv_arr).mean(axis=(0, 1))
-                best_cls = int(np.argmax(mean_abs))
+                mean_abs  = np.abs(sv_arr).mean(axis=(0, 1))
+                best_cls  = int(np.argmax(mean_abs))
                 shap_vals = sv_arr[:, :, best_cls]
                 expected  = explainer.expected_value[best_cls]
             else:
@@ -341,17 +405,14 @@ def get_shap_values(model_name, model, is_keras, X_train, X_test, y_test,
                 expected  = explainer.expected_value
 
     elif model_name == 'Custom MLP':
-        # DeepExplainer needs the raw Keras model
         bg_tensor = bg.values.astype(np.float32)
         explainer = shap.DeepExplainer(model, bg_tensor)
         sv = explainer.shap_values(X_test.values.astype(np.float32))
 
         def _extract_ev(ev, idx=None):
-            """Safely pull a scalar from whatever DeepExplainer returns."""
             val = ev[idx] if idx is not None else ev
             return float(np.squeeze(np.array(val)).ravel()[0])
 
-        # DeepExplainer may return (n, features, 1) for binary sigmoid — squeeze trailing dim
         if isinstance(sv, list):
             sv = [np.squeeze(s) if s.ndim == 3 else s for s in sv]
             mean_abs  = [np.abs(s).mean() for s in sv]
@@ -362,8 +423,8 @@ def get_shap_values(model_name, model, is_keras, X_train, X_test, y_test,
         else:
             sv_arr = np.asarray(sv)
             if sv_arr.ndim == 3 and sv_arr.shape[-1] > 1:
-                mean_abs = np.abs(sv_arr).mean(axis=(0, 1))
-                best_cls = int(np.argmax(mean_abs))
+                mean_abs  = np.abs(sv_arr).mean(axis=(0, 1))
+                best_cls  = int(np.argmax(mean_abs))
                 shap_vals = sv_arr[:, :, best_cls]
                 expected  = _extract_ev(explainer.expected_value, best_cls)
             else:
@@ -377,7 +438,7 @@ def get_shap_values(model_name, model, is_keras, X_train, X_test, y_test,
 
 
 # ─────────────────────────────────────────────────────────────
-# PLOTTERS
+# PLOTTERS  (unchanged — work on any (n_samples, n_features) SHAP matrix)
 # ─────────────────────────────────────────────────────────────
 
 def _title_str(target_name: str) -> str:
@@ -385,12 +446,9 @@ def _title_str(target_name: str) -> str:
 
 
 def plot_beeswarm(target_name, shap_vals, X_test, top_n=TOP_N):
-    """
-    Beeswarm plot: each point = one patient.
-    X-axis = SHAP value (pushes prediction left/right).
-    Color   = actual feature value (blue=low, red=high).
-    """
     mean_abs = np.abs(shap_vals).mean(axis=0)
+    # For stacking, n_features may be <= 5, cap top_n
+    top_n    = min(top_n, shap_vals.shape[1])
     top_idx  = np.argsort(mean_abs)[::-1][:top_n]
 
     sv_top   = shap_vals[:, top_idx]
@@ -399,32 +457,26 @@ def plot_beeswarm(target_name, shap_vals, X_test, top_n=TOP_N):
 
     fig, ax  = plt.subplots(figsize=(10, 0.45 * top_n + 2))
 
-    # Normalize feature values to [0,1] for coloring
-    X_arr = X_top.values.astype(float)
+    X_arr  = X_top.values.astype(float)
     X_norm = (X_arr - X_arr.min(axis=0)) / ((X_arr.max(axis=0) - X_arr.min(axis=0)) + 1e-9)
-
-    cmap = plt.get_cmap('RdBu_r')
+    cmap   = plt.get_cmap('RdBu_r')
 
     for row_i in range(top_n):
-        feat_i  = top_n - 1 - row_i   # reverse so top feature is at top
+        feat_i  = top_n - 1 - row_i
         y_base  = row_i
         sv_col  = sv_top[:, feat_i]
         c_col   = X_norm[:, feat_i]
-
-        # Jitter points vertically so they don't all overlap
-        rng    = np.random.default_rng(feat_i)
-        jitter = rng.uniform(-0.25, 0.25, size=len(sv_col))
-
-        ax.scatter(sv_col, y_base + jitter,
-                   c=cmap(c_col), alpha=0.45, s=6, linewidths=0)
+        rng     = np.random.default_rng(feat_i)
+        jitter  = rng.uniform(-0.25, 0.25, size=len(sv_col))
+        ax.scatter(sv_col, y_base + jitter, c=cmap(c_col), alpha=0.45, s=6, linewidths=0)
 
     ax.set_yticks(range(top_n))
     ax.set_yticklabels([feat_top[top_n - 1 - i] for i in range(top_n)], fontsize=9)
     ax.axvline(0, color='#5F5E5A', lw=0.8, linestyle='--')
     ax.set_xlabel('SHAP value  (impact on model output)', fontsize=10)
-    ax.set_title(f'{_title_str(target_name)} — SHAP beeswarm (top {top_n} features)', fontsize=11, fontweight='bold')
+    ax.set_title(f'{_title_str(target_name)} — SHAP beeswarm (top {top_n} features)',
+                 fontsize=11, fontweight='bold')
 
-    # Colorbar
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
     sm.set_array([])
     cb = fig.colorbar(sm, ax=ax, orientation='vertical', fraction=0.015, pad=0.02)
@@ -440,32 +492,27 @@ def plot_beeswarm(target_name, shap_vals, X_test, top_n=TOP_N):
 
 
 def plot_bar(target_name, shap_vals, feature_names, top_n=TOP_N):
-    """
-    Mean |SHAP| bar chart — global feature importance.
-    """
+    top_n    = min(top_n, shap_vals.shape[1])
     mean_abs = np.abs(shap_vals).mean(axis=0)
     top_idx  = np.argsort(mean_abs)[::-1][:top_n]
     feats    = [feature_names[i] for i in top_idx]
     vals     = mean_abs[top_idx]
 
-    # Reverse for horizontal bar (highest at top)
     feats, vals = feats[::-1], vals[::-1]
 
     fig, ax = plt.subplots(figsize=(9, 0.40 * top_n + 2))
-    bars = ax.barh(range(top_n), vals,
-                   color=PALETTE['bar_fill'], edgecolor=PALETTE['bar_edge'],
-                   linewidth=0.4, height=0.65)
+    bars = ax.barh(range(top_n), vals, color=PALETTE['bar_fill'],
+                   edgecolor=PALETTE['bar_edge'], linewidth=0.4, height=0.65)
 
-    # Value labels on bars
     for b, v in zip(bars, vals):
         ax.text(b.get_width() + max(vals) * 0.01, b.get_y() + b.get_height() / 2,
-                f'{v:.4f}', va='center', ha='left', fontsize=8,
-                color='var(--color-text-secondary)' if False else '#444441')
+                f'{v:.4f}', va='center', ha='left', fontsize=8, color='#444441')
 
     ax.set_yticks(range(top_n))
     ax.set_yticklabels(feats, fontsize=9)
     ax.set_xlabel('Mean |SHAP value|  (average impact on model output)', fontsize=10)
-    ax.set_title(f'{_title_str(target_name)} — Global feature importance (top {top_n})', fontsize=11, fontweight='bold')
+    ax.set_title(f'{_title_str(target_name)} — Global feature importance (top {top_n})',
+                 fontsize=11, fontweight='bold')
     ax.set_xlim([0, max(vals) * 1.18])
 
     plt.tight_layout()
@@ -476,74 +523,57 @@ def plot_bar(target_name, shap_vals, feature_names, top_n=TOP_N):
 
 
 def plot_waterfall(target_name, shap_vals, expected_value, X_test, y_test, task_type):
-    """
-    Waterfall for the single highest-risk patient in the test set.
-    Shows the top features that pushed the prediction up or down from the base value.
-    """
-    # Pick the patient with the highest total SHAP sum (most "at risk")
     if task_type == 'binary':
         patient_idx = int(np.argmax(shap_vals.sum(axis=1)))
     else:
         patient_idx = int(np.argmax(np.abs(shap_vals).sum(axis=1)))
 
-    sv_patient   = shap_vals[patient_idx]
-    feat_vals    = X_test.iloc[patient_idx].values
-    feat_names   = list(X_test.columns)
-    true_label   = y_test[patient_idx]
+    sv_patient = shap_vals[patient_idx]
+    feat_vals  = X_test.iloc[patient_idx].values
+    feat_names = list(X_test.columns)
+    true_label = y_test[patient_idx]
 
-    # Sort by absolute SHAP and take top features
     display_n = min(15, len(feat_names))
     top_idx   = np.argsort(np.abs(sv_patient))[::-1][:display_n]
 
-    sv_top    = sv_patient[top_idx][::-1]
-    fv_top    = feat_vals[top_idx][::-1]
-    fn_top    = [feat_names[i] for i in top_idx][::-1]
+    sv_top = sv_patient[top_idx][::-1]
+    fv_top = feat_vals[top_idx][::-1]
+    fn_top = [feat_names[i] for i in top_idx][::-1]
 
-    # Cumulative sum for waterfall positioning
-    base      = float(expected_value)
-    running   = base
-    lefts, widths, colors, midpoints = [], [], [], []
+    base    = float(expected_value)
+    running = base
+    lefts, widths, colors = [], [], []
     for v in sv_top:
         lefts.append(min(running, running + v))
         widths.append(abs(v))
         colors.append(PALETTE['waterfall_pos'] if v >= 0 else PALETTE['waterfall_neg'])
-        midpoints.append(running + v / 2)
         running += v
     final_pred = running
 
     fig, ax = plt.subplots(figsize=(10, 0.5 * display_n + 2.5))
-
-    # Base value line
     ax.axvline(base, color='#888780', lw=1.2, linestyle='--', label=f'Base value = {base:.4f}')
 
     bars = ax.barh(range(display_n), widths, left=lefts, color=colors,
                    edgecolor='white', linewidth=0.4, height=0.6)
 
-    # SHAP value labels
     for i, (b, v) in enumerate(zip(bars, sv_top)):
         sign  = '+' if v >= 0 else ''
         x_pos = lefts[i] + widths[i] + 0.002 if v >= 0 else lefts[i] - 0.002
         ha    = 'left' if v >= 0 else 'right'
         ax.text(x_pos, i, f'{sign}{v:.4f}', va='center', ha=ha, fontsize=8)
 
-    # Feature labels with actual values
     labels_with_val = [f'{fn_top[i]}  = {fv_top[i]:.3g}' for i in range(display_n)]
     ax.set_yticks(range(display_n))
     ax.set_yticklabels(labels_with_val, fontsize=8.5)
-
-    # Final prediction marker
     ax.axvline(final_pred, color='#3C3489', lw=1.5, linestyle='-',
                label=f'Prediction = {final_pred:.4f}')
-
     ax.set_xlabel('SHAP contribution  (cumulative from base value)', fontsize=10)
     ax.set_title(
         f'{_title_str(target_name)} — Highest-risk patient waterfall\n'
         f'True label: {true_label}  |  Prediction: {final_pred:.4f}  |  Base: {base:.4f}',
         fontsize=10, fontweight='bold'
     )
-    ax.legend(fontsize=9, loc='lower right')
 
-    # Positive / negative legend patches
     from matplotlib.patches import Patch
     ax.legend(handles=[
         ax.axvline(base, color='#888780', lw=1.2, linestyle='--'),
@@ -598,33 +628,32 @@ def main():
         print(f"MODEL  : {model_name}  |  MATRIX : {matrix_name}")
         print(f"{'─'*60}")
 
-        # Skip targets already completed in a previous run
         if (OUT_DIR / f'{target_name}_waterfall.png').exists():
             print(f'   [skip] already complete — delete PNG to re-run.')
             continue
 
-        # Load data
         (X_train, X_test, y_train, y_test,
          n_classes, class_names, feat_names) = load_data(target_name, matrix_name)
 
         print(f"   Train: {len(X_train):,}  |  Test: {len(X_test):,}  |  Features: {len(feat_names)}")
 
-        # Train model
+        # Train (or re-assemble) the model
         print(f"   Retraining {model_name}...")
-        model, is_keras = train_model(model_name, params, task_type, n_classes,
-                                      X_train, y_train)
+        if model_name == 'Stacking Ensemble':
+            print(f"   [Stacking] Running OOF + meta-learner fit (this takes a few minutes)...")
+        model, is_keras = train_model(model_name, params, task_type, n_classes, X_train, y_train)
 
-        # SHAP values
+        # Explainer selection info
         print(f"   Computing SHAP values ({model_name} → ", end='')
         if model_name in ('CatBoost', 'XGBoost', 'Random Forest'):
             print("TreeExplainer)...")
-        elif model_name == 'Logistic Regression':
+        elif model_name in ('Logistic Regression', 'Stacking Ensemble'):
             print("LinearExplainer)...")
         else:
             print(f"DeepExplainer, background n={BACKGROUND_N})...")
 
         shap_n = SHAP_EXPLAIN_N_RF if model_name == 'Random Forest' else SHAP_EXPLAIN_N
-        print(f"   SHAP sampling cap: {shap_n} rows  |  Background: {min(BACKGROUND_N, len(X_train))}")
+        print(f"   SHAP sampling cap: {shap_n} rows")
         t0 = time.perf_counter()
         shap_vals, expected_val, X_test_df, y_test_shap = get_shap_values(
             model_name, model, is_keras,
@@ -635,20 +664,22 @@ def main():
         print(f"   SHAP matrix: {shap_vals.shape}  |  Expected value: {expected_val:.4f}")
         print(f"   SHAP compute time: {elapsed/60:.1f} min")
 
-        # Plots
+        if model_name == 'Stacking Ensemble':
+            feat_names_shap = list(X_test_df.columns)   # base-learner names
+            print(f"   [Stacking] Meta-learner features: {feat_names_shap}")
+        else:
+            feat_names_shap = feat_names
+
         print("   Generating plots...")
         plot_beeswarm(target_name, shap_vals, X_test_df)
-        plot_bar(target_name, shap_vals, feat_names)
-        plot_waterfall(target_name, shap_vals, expected_val,
-                       X_test_df, y_test_shap, task_type)
+        plot_bar(target_name, shap_vals, feat_names_shap)
+        plot_waterfall(target_name, shap_vals, expected_val, X_test_df, y_test_shap, task_type)
 
-        # Cleanup
         if is_keras:
             K.clear_session()
         del model, shap_vals
         gc.collect()
 
-    # ── SUMMARY TABLE  ──────────────────────────────────────
     print("\n" + "=" * 70)
     print("SHAP ANALYSIS COMPLETE")
     print(f"All plots saved to: {OUT_DIR.absolute()}")
@@ -656,9 +687,10 @@ def main():
     print("  <target>_beeswarm.png  — per-patient SHAP distribution (top 20 features)")
     print("  <target>_bar.png       — global importance (mean |SHAP|)")
     print("  <target>_waterfall.png — highest-risk patient breakdown")
+    print("\nNote for Stacking Ensemble targets:")
+    print("  Feature names in plots = base learner short codes (CB, XGB, LGB, RF, LR).")
+    print("  SHAP values show which base learner the meta-learner relies on most.")
     print("\n[NEXT] Review beeswarm plots for clinical sanity-checking.")
-    print("       Cross-reference top features against known clinical literature.")
-    print("       Flag any features with unexpectedly high importance (data leakage check).")
 
 
 if __name__ == '__main__':
