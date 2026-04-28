@@ -58,6 +58,26 @@ MODEL_NAMES = [
 ]
 
 
+def _normalize_results(results: dict) -> dict:
+    """
+    Back-fills any target / model / matrix keys that are missing from a
+    previously-saved JSON file.  This happens whenever a new model (e.g.
+    'Stacking Ensemble') or a new matrix is added after some results have
+    already been checkpointed.  Missing slots are initialised to None so
+    downstream write operations never raise a KeyError.
+    """
+    for target in TARGETS:
+        if target not in results:
+            results[target] = {}
+        for model in MODEL_NAMES:
+            if model not in results[target]:
+                results[target][model] = {}
+            for matrix in MATRICES:
+                if matrix not in results[target][model]:
+                    results[target][model][matrix] = None
+    return results
+
+
 def get_baseline_models(task_type, n_classes, y_train):
     if task_type == 'binary':
         neg = np.sum(y_train == 0)
@@ -126,6 +146,9 @@ def run_full_tournament():
         with open(results_file, 'r') as f:
             results = json.load(f)
         print("  [+] Loaded previous tournament scores from JSON.")
+        # ── FIX: back-fill any keys that didn't exist when the JSON was saved
+        # (e.g. 'Stacking Ensemble' added after an earlier partial run).
+        results = _normalize_results(results)
     else:
         results = {
             t: {m: {mat: None for mat in MATRICES.keys()} for m in MODEL_NAMES}
