@@ -3,26 +3,23 @@
     "model": "CatBoost",
     "matrix": "LASSO",
     "params": {
-      "iterations": 728,
-      "learning_rate": 0.05006992692373053,
-      "depth": 5,
-      "l2_leaf_reg": 0.721914378485635,
-      "bagging_temperature": 0.13071890048759408,
-      "random_strength": 2.481783475807269,
-      "border_count": 33
+      "iterations": 775,
+      "learning_rate": 0.018536673161180843,
+      "depth": 8,
+      "l2_leaf_reg": 4.455265811425704
     }
   },
   "aki_onset": {
     "model": "Custom MLP",
     "matrix": "LASSO",
     "params": {
-      "units_1": 128,
-      "units_2": 32,
+      "units_1": 256,
+      "units_2": 128,
       "units_3": 32,
-      "dropout_1": 0.4107536458214755,
-      "dropout_2": 0.17393066706927918,
-      "lr": 0.0014234677331409786,
-      "batch_size": 32
+      "dropout_1": 0.30003757649057683,
+      "dropout_2": 0.27898615832272006,
+      "lr": 0.00018454425263625157,
+      "batch_size": 64
     }
   },
   "sepsis_onset": {

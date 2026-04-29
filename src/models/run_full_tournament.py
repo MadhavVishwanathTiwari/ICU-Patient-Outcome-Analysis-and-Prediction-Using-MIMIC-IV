@@ -266,16 +266,19 @@ def run_full_tournament():
             K.clear_session()
             gc.collect()
 
-            # ── Stacking Ensemble (NEW — 7th competitor) ──────────────────
-            # Note: each call runs 5-fold OOF over 5 base learners, so it is
-            # ~5× slower per (target, matrix) slot than a single baseline.
-            # Runtime estimate: ~3–8 min per slot depending on dataset size.
+            # ── Stacking Ensemble (7th competitor) ───────────────────────
+            # Level 0: CB, XGB, LGB, RF, LR, MLP  (6 base learners)
+            # Level 1: Logistic Regression meta-learner
+            # MLP at Level 0 adds neural diversity alongside the 5 tree/linear
+            # models — Level 1 can exploit the blind-spot coverage.
+            # Runtime: ~5-fold OOF × 6 base learners → estimate 5–10 min/slot.
             print(f"  [+] Training Stacking Ensemble   on {matrix_name:5}...", end='\r')
             try:
                 stack_auc, stack_preds, _, _, _, _ = run_stacking_for_tournament(
                     X_train_scaled, X_test_scaled,
                     y_train, y_test,
-                    task_type, n_classes
+                    task_type, n_classes,
+                    input_dim=X_train_scaled.shape[1]   # required to build MLP graph
                 )
                 results[target_name]['Stacking Ensemble'][matrix_name] = stack_auc
                 if stack_auc > best_auc:

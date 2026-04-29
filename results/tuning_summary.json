@@ -4,16 +4,16 @@
     "Model": "CatBoost",
     "Matrix": "LASSO",
     "Baseline AUC": 0.8898,
-    "Tuned AUC": 0.8966,
-    "Delta": 0.0068
+    "Tuned AUC": 0.8960075125571006,
+    "Delta": 0.006207512557100614
   },
   "aki_onset": {
     "Target": "aki_onset",
     "Model": "Custom MLP",
     "Matrix": "LASSO",
     "Baseline AUC": 0.8187,
-    "Tuned AUC": 0.8191,
-    "Delta": 0.0004
+    "Tuned AUC": 0.8184308975999994,
+    "Delta": -0.00026910240000055374
   },
   "sepsis_onset": {
     "Target": "sepsis_onset",
