@@ -14,9 +14,11 @@ Explainer selection
   CatBoost / XGBoost / Random Forest  → TreeExplainer  (fast, exact)
   Logistic Regression                 → LinearExplainer (fast)
   Custom MLP                          → DeepExplainer   (fast for keras)
+  FT-Transformer                      → KernelExplainer on a background sample
+      (PyTorch model; no native SHAP backend — kernel is exact enough for top-20 features)
   Stacking Ensemble                   → LinearExplainer on the meta-learner.
-      Features are the 5 base-learner OOF predictions (binary) or
-      5 × n_classes predictions (multiclass).
+      Features are the 7 base-learner OOF predictions (binary) or
+      7 × n_classes predictions (multiclass).
       This answers "which base learner does the meta-learner trust most?"
 
 Run:
@@ -63,6 +65,7 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
 import tensorflow.keras.backend as K
 
+from src.models.ft_transformer import build_ftt, train_ftt, predict_ftt, get_device
 from src.models.stacking_model import (           # ← NEW
     precompute_oof, train_meta_learner,
     get_test_meta_features, get_oof_feature_names
@@ -258,12 +261,33 @@ def train_model(model_name, params, task_type, n_classes, X_train, y_train):
               class_weight=cw, verbose=0)
         return m, True
 
+    elif model_name == 'FT-Transformer':
+        device = get_device()
+        ftt = build_ftt(
+            input_dim=X_train.shape[1],
+            task_type=task_type,
+            n_classes=n_classes,
+        )
+        ftt = train_ftt(
+            model=ftt,
+            X_tr=X_train.values if hasattr(X_train, 'values') else X_train,
+            y_tr=y_train,
+            device=device,
+            epochs=50,
+            batch_size=256,
+            patience=5,
+            val_fraction=0.15,
+        )
+        # Stash device on model so get_shap_values can retrieve it without re-resolving
+        ftt._shap_device = device
+        return ftt, False
+
     elif model_name == 'Stacking Ensemble':
         # ── NEW ──────────────────────────────────────────────────────────
         meta_C = params.get('meta_C', 1.0)
         oof_matrix, trained_bases, base_names = precompute_oof(
             X_train.values, y_train, task_type, n_classes,
-            input_dim=X_train.shape[1]   # FIX: required to build MLP + FTT graphs
+            input_dim=X_train.shape[1]
         )
         meta           = train_meta_learner(oof_matrix, y_train, meta_C)
         oof_feat_names = get_oof_feature_names(base_names, task_type, n_classes)
@@ -431,6 +455,29 @@ def get_shap_values(model_name, model, is_keras, X_train, X_test, y_test,
             else:
                 shap_vals = np.squeeze(sv_arr) if sv_arr.ndim == 3 else sv_arr
                 expected  = _extract_ev(explainer.expected_value)
+
+    elif model_name == 'FT-Transformer':
+        # KernelExplainer: model-agnostic, works on any PyTorch model.
+        # Use a small background sample (50 rows) to keep runtime reasonable.
+        device = getattr(model, '_shap_device', get_device())
+
+        def _ftt_predict(X_np):
+            return predict_ftt(model, X_np.astype(np.float32), device, task_type)
+
+        bg_np     = shap.sample(bg, min(50, len(bg))).values.astype(np.float32)
+        explainer = shap.KernelExplainer(_ftt_predict, bg_np)
+        X_test_np = X_test.values.astype(np.float32)
+        sv        = explainer.shap_values(X_test_np, nsamples=100, silent=True)
+
+        if isinstance(sv, list):
+            mean_abs  = [np.abs(s).mean() for s in sv]
+            best_cls  = int(np.argmax(mean_abs))
+            shap_vals = sv[best_cls]
+            expected  = float(np.array(explainer.expected_value).ravel()[best_cls])
+        else:
+            sv_arr    = np.asarray(sv)
+            shap_vals = sv_arr
+            expected  = float(np.array(explainer.expected_value).ravel()[0])
 
     else:
         raise ValueError(f"No SHAP strategy for {model_name}")
