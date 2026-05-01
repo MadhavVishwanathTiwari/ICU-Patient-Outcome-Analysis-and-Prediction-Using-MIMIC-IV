@@ -1,33 +1,61 @@
 """
 Stacking Ensemble — MIMIC-IV Clinical Prediction Tournament
 =============================================================
-Implements 5-fold Out-of-Fold (OOF) stacking with 6 base learners
-(CatBoost, XGBoost, LightGBM, Random Forest, Logistic Regression, Custom MLP)
-and a Logistic Regression meta-learner.
+Implements 5-fold Out-of-Fold (OOF) stacking with 7 base learners
+(CatBoost, XGBoost, LightGBM, Random Forest, Logistic Regression,
+Custom MLP, FT-Transformer) and a Logistic Regression meta-learner.
 
-Design rationale
-----------------
-• Base learners are 5 sklearn-compatible tree/linear models PLUS the Custom MLP.
-  Including the MLP at Level 0 is deliberate: all five tree/linear models partition
-  feature space with axis-aligned splits and tend to be wrong in similar regions.
-  The MLP learns smooth, non-linear boundaries and will be confident in different
-  places, giving the Level 1 meta-learner genuine diversity to exploit.
+Change log vs previous version
+-------------------------------
+v2: Added FT-Transformer (FTT) as the 7th base learner at index 6.
 
-• MLP is handled separately from the sklearn models inside the OOF loop because:
-    – Keras models cannot be reliably deepcopy'd (graph state issues).
-    – The model must be rebuilt fresh for each fold to avoid weight leakage.
-    – K.clear_session() is called after each fold to prevent GPU/memory buildup.
-  Hyperparameters are deliberately conservative (50 epochs, patience=5) to keep
-  OOF tractable across 48 (target × matrix) slots.
+    Motivation:
+    ──────────
+    The five tree/linear models and the MLP provide complementary signals,
+    but all share one characteristic: they process features independently
+    or via coarse interactions (splits/dot-products).  The FT-Transformer
+    uses full pairwise self-attention across ALL feature tokens on every
+    forward pass, learning high-order feature interactions explicitly.
+    This is particularly valuable for the hard readmission targets
+    (icu_readmit_48h ~0.59, icu_readmit_7d ~0.61) where tree ensembles
+    plateau and any additional diversity is worth having at Level 1.
 
-• Meta-learner is always Logistic Regression: interpretable, SHAP-compatible via
-  LinearExplainer, and a 6-dimensional input space will never overfit it.
+    Implementation constraints respected:
+    ──────────────────────────────────────
+    • FTT uses PyTorch, MLP uses TF/Keras → no framework conflicts.
+    • FTT is rebuilt fresh per fold, deleted + gc.collect() after each fold,
+      mirroring the MLP's lifecycle exactly.
+    • torch.cuda / MPS auto-detection via get_device() in ft_transformer.py.
+    • Public API signatures are UNCHANGED — all callers (run_full_tournament,
+      tune_winners, shap_analysis) require zero edits.
 
-• OOF generation is the only expensive step. For tuning (Phase 4), OOF is
-  pre-computed ONCE with default base learners; Optuna then tunes only meta_C.
+    OOF matrix shape change:
+    ────────────────────────
+    Binary     : (n_train,  6) → (n_train,  7)
+    Multiclass : (n_train, 6C) → (n_train, 7C)
+    The meta-learner (LogisticRegression) sees one extra column; its 7-column
+    input space is still trivially small relative to any training set size.
 
-Public API
-----------
+Design rationale (carried forward)
+-----------------------------------
+• Base learners are sklearn-compatible tree/linear models PLUS two neural
+  models (MLP + FTT).  Axis-aligned splits and smooth non-linear boundaries
+  are wrong in different regions; the meta-learner exploits the diversity.
+
+• MLP and FTT are handled separately from the sklearn models in the OOF loop:
+    – Neither can be reliably deepcopy'd.
+    – Both must be rebuilt fresh per fold to avoid weight leakage.
+    – MLP: K.clear_session() + gc.collect() after each fold.
+    – FTT: del model + gc.collect() (+ torch.cuda.empty_cache() if CUDA).
+
+• Meta-learner is always Logistic Regression: interpretable, SHAP-compatible
+  via LinearExplainer, and a 7-column input space will never overfit it.
+
+• OOF generation is the only expensive step.  For tuning (Phase 4), OOF is
+  pre-computed ONCE with default base learners; Optuna tunes only meta_C.
+
+Public API  (signatures UNCHANGED from v1)
+------------------------------------------
 run_stacking_for_tournament(X_train, X_test, y_train, y_test,
                              task_type, n_classes, input_dim, meta_C=1.0)
     → (auc, final_preds, meta, trained_bases, base_names, oof_feat_names)
@@ -58,14 +86,29 @@ import lightgbm as lgb
 from catboost import CatBoostClassifier
 from tensorflow.keras.callbacks import EarlyStopping
 import tensorflow.keras.backend as K
+import torch
 
 from src.models.custom_mlp import build_custom_mlp, compute_class_weights
+from src.models.ft_transformer import (
+    build_ftt, train_ftt, predict_ftt, get_device
+)
 
 # ── Constants ───────────────────────────────────────────────────────────────
-N_FOLDS    = 5
-# MLP added as 6th base learner — gives Level 1 a neural signal alongside
-# the 5 tree/linear models, improving blind-spot coverage.
-BASE_NAMES = ['CB', 'XGB', 'LGB', 'RF', 'LR', 'MLP']
+N_FOLDS = 5
+
+# FTT added as 7th base learner (index 6).  Order is load-bearing: _fill_slot
+# uses b_idx directly, so BASE_NAMES must never be re-sorted.
+BASE_NAMES = ['CB', 'XGB', 'LGB', 'RF', 'LR', 'MLP', 'FTT']
+
+# Lazily resolved once at first use; avoids repeated CUDA/MPS probe overhead
+_DEVICE: torch.device | None = None
+
+
+def _get_device() -> torch.device:
+    global _DEVICE
+    if _DEVICE is None:
+        _DEVICE = get_device()
+    return _DEVICE
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
@@ -74,8 +117,8 @@ def _build_sklearn_base_learners(task_type: str, n_classes: int,
                                   y_train: np.ndarray) -> dict:
     """
     Returns fresh untrained instances of the 5 sklearn-compatible base learners.
-    MLP is excluded here because it requires input_dim and cannot be deepcopy'd;
-    it is handled separately in the OOF loop via _build_mlp_fresh().
+    MLP and FTT are excluded because they cannot be deepcopy'd and require
+    input_dim at construction time; both are handled separately in the OOF loop.
     """
     neg = int(np.sum(y_train == 0))
     pos = int(np.sum(y_train == 1))
@@ -112,16 +155,30 @@ def _build_sklearn_base_learners(task_type: str, n_classes: int,
 
 
 def _build_mlp_fresh(input_dim: int, task_type: str, n_classes: int):
-    """
-    Builds a fresh (uncompiled-graph) Custom MLP for one fold or full retraining.
-    Called instead of deepcopy because Keras models cannot be safely deepcopy'd.
-    Conservative epochs/patience to keep OOF tractable across 48 tournament slots.
-    """
+    """Builds a fresh Custom MLP for one fold.  Never deepcopy'd."""
     return build_custom_mlp(
         input_dim=input_dim,
         task_type=task_type,
-        n_classes=n_classes
-        # uses default units/dropout/lr from custom_mlp.py
+        n_classes=n_classes,
+    )
+
+
+def _build_ftt_fresh(input_dim: int, task_type: str, n_classes: int):
+    """
+    Builds a fresh FT-Transformer for one fold.  Never deepcopy'd.
+    Conservative defaults (n_blocks=2, d_token=64, n_heads=4) keep OOF
+    runtime tractable while still providing genuine attention-based signal.
+    """
+    return build_ftt(
+        input_dim=input_dim,
+        task_type=task_type,
+        n_classes=n_classes,
+        d_token=64,
+        n_heads=4,
+        n_blocks=2,
+        ffn_d_hidden=128,
+        attn_dropout=0.1,
+        ffn_dropout=0.1,
     )
 
 
@@ -138,9 +195,9 @@ def _fit_sklearn(model, bname: str, task_type: str,
 
 def _fit_mlp(model, X_tr: np.ndarray, y_tr: np.ndarray):
     """
-    Fits the MLP with early stopping and class weighting.
-    Fewer epochs (50) and tighter patience (5) vs the standalone tournament MLP
-    (100 epochs, patience 10) to keep 5-fold OOF time reasonable.
+    Fits the Keras MLP with early stopping and class weighting.
+    Fewer epochs (50) and tighter patience (5) vs standalone tournament MLP
+    to keep 5-fold OOF time reasonable.
     """
     cw = compute_class_weights(y_tr)
     early_stop = EarlyStopping(monitor='val_loss', patience=5,
@@ -151,6 +208,26 @@ def _fit_mlp(model, X_tr: np.ndarray, y_tr: np.ndarray):
         callbacks=[early_stop], class_weight=cw, verbose=0
     )
     return model
+
+
+def _fit_ftt(model, X_tr: np.ndarray, y_tr: np.ndarray,
+             device: torch.device):
+    """
+    Trains FT-Transformer via train_ftt().  Identical budget to the OOF MLP
+    (50 epochs, patience=5) so wall-clock time is comparable.
+    """
+    return train_ftt(
+        model=model,
+        X_tr=X_tr,
+        y_tr=y_tr,
+        device=device,
+        epochs=50,
+        batch_size=256,
+        lr=1e-3,
+        weight_decay=1e-4,
+        patience=5,
+        val_fraction=0.15,
+    )
 
 
 def _predict_proba_sklearn(model, bname: str, task_type: str,
@@ -164,12 +241,17 @@ def _predict_proba_mlp(model, task_type: str, X: np.ndarray) -> np.ndarray:
     return preds.flatten() if task_type == 'binary' else preds
 
 
+def _predict_proba_ftt(model, task_type: str,
+                        X: np.ndarray, device: torch.device) -> np.ndarray:
+    return predict_ftt(model, X, device, task_type)
+
+
 def _oof_matrix_shape(n_rows: int, task_type: str, n_classes: int) -> tuple:
     """
-    Binary    → (n_rows, 6)          one probability column per base learner
-    Multiclass → (n_rows, 6 * C)     one block of C columns per base learner
+    Binary     → (n_rows,  7)       one probability column per base learner
+    Multiclass → (n_rows,  7 * C)   one block of C columns per base learner
     """
-    n_bases = len(BASE_NAMES)
+    n_bases = len(BASE_NAMES)   # 7
     return (n_rows, n_bases) if task_type == 'binary' else (n_rows, n_bases * n_classes)
 
 
@@ -182,13 +264,25 @@ def _fill_slot(matrix: np.ndarray, row_idx, b_idx: int,
         matrix[row_idx, b_idx * n_classes: (b_idx + 1) * n_classes] = proba
 
 
+def _cleanup_ftt(model) -> None:
+    """
+    Deterministically frees FTT GPU/CPU memory after each fold.
+    Mirrors K.clear_session() + gc.collect() used for the MLP.
+    """
+    device = next(model.parameters()).device
+    del model
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def get_oof_feature_names(base_names: list, task_type: str, n_classes: int) -> list:
     """
     Returns human-readable feature names for the meta-learner's input space.
-    Binary     : ['CB', 'XGB', 'LGB', 'RF', 'LR', 'MLP']
-    Multiclass : ['CB_c0', ..., 'MLP_c{C-1}']
+    Binary     : ['CB', 'XGB', 'LGB', 'RF', 'LR', 'MLP', 'FTT']
+    Multiclass : ['CB_c0', ..., 'FTT_c{C-1}']
     """
     if task_type == 'binary':
         return list(base_names)
@@ -199,25 +293,32 @@ def precompute_oof(X_train: np.ndarray, y_train: np.ndarray,
                    task_type: str, n_classes: int,
                    input_dim: int) -> tuple:
     """
-    Generates OOF predictions for ALL 6 base learners via StratifiedKFold,
-    then trains each base learner on the FULL training set.
+    Generates OOF predictions for ALL 7 base learners via StratifiedKFold,
+    then retrains each base learner on the FULL training set.
 
-    The MLP is rebuilt fresh per fold (no deepcopy) and K.clear_session() is
-    called after each fold's MLP fit to prevent GPU/memory accumulation.
+    Fold lifecycle for neural models
+    ---------------------------------
+    MLP (index 5):
+        rebuilt via _build_mlp_fresh → trained → predict → K.clear_session() + gc.collect()
+
+    FTT (index 6):
+        rebuilt via _build_ftt_fresh → trained on device → predict → _cleanup_ftt()
+        _cleanup_ftt calls del + gc.collect() + torch.cuda.empty_cache() if CUDA
 
     Parameters
     ----------
     X_train, y_train : scaled numpy arrays from the tournament pipeline
     task_type        : 'binary' | 'multiclass'
     n_classes        : number of target classes
-    input_dim        : number of input features (needed to build MLP graph)
+    input_dim        : number of input features (needed to build MLP + FTT graphs)
 
     Returns
     -------
-    oof_matrix    : np.ndarray — shape (n_train, 6) or (n_train, 6*C)
+    oof_matrix    : np.ndarray — shape (n_train, 7) or (n_train, 7*C)
     trained_bases : dict  {bname: fitted_model}  trained on FULL X_train
     base_names    : list[str]  — always BASE_NAMES order
     """
+    device       = _get_device()
     sklearn_defs = _build_sklearn_base_learners(task_type, n_classes, y_train)
     n_train      = len(y_train)
     oof_matrix   = np.zeros(_oof_matrix_shape(n_train, task_type, n_classes),
@@ -229,23 +330,32 @@ def precompute_oof(X_train: np.ndarray, y_train: np.ndarray,
         X_tr, X_val = X_train[tr_idx], X_train[val_idx]
         y_tr, y_val = y_train[tr_idx], y_train[val_idx]
 
-        # ── sklearn base learners (CB, XGB, LGB, RF, LR) ─────────────────
+        # ── sklearn base learners (CB, XGB, LGB, RF, LR) — indices 0-4 ───
         for b_idx, (bname, bmodel_template) in enumerate(sklearn_defs.items()):
             fold_model = copy.deepcopy(bmodel_template)
             fold_model = _fit_sklearn(fold_model, bname, task_type, X_tr, y_tr)
             proba      = _predict_proba_sklearn(fold_model, bname, task_type, X_val)
             _fill_slot(oof_matrix, val_idx, b_idx, proba, task_type, n_classes)
 
-        # ── MLP (index 5) — rebuilt fresh, cleared after each fold ────────
-        mlp_fold = _build_mlp_fresh(input_dim, task_type, n_classes)
-        mlp_fold = _fit_mlp(mlp_fold, X_tr, y_tr)
+        # ── MLP (index 5) — rebuilt fresh, Keras session cleared after ────
+        mlp_fold  = _build_mlp_fresh(input_dim, task_type, n_classes)
+        mlp_fold  = _fit_mlp(mlp_fold, X_tr, y_tr)
         mlp_proba = _predict_proba_mlp(mlp_fold, task_type, X_val)
         _fill_slot(oof_matrix, val_idx, 5, mlp_proba, task_type, n_classes)
+        del mlp_fold
         K.clear_session()
         gc.collect()
 
+        # ── FTT (index 6) — rebuilt fresh, GPU memory freed after ─────────
+        ftt_fold  = _build_ftt_fresh(input_dim, task_type, n_classes)
+        ftt_fold  = _fit_ftt(ftt_fold, X_tr, y_tr, device)
+        ftt_proba = _predict_proba_ftt(ftt_fold, task_type, X_val, device)
+        _fill_slot(oof_matrix, val_idx, 6, ftt_proba, task_type, n_classes)
+        _cleanup_ftt(ftt_fold)
+
     # ── Retrain everything on the FULL training set ───────────────────────
-    trained_bases = {}
+    trained_bases: dict = {}
+
     for bname, bmodel_template in sklearn_defs.items():
         full_model = copy.deepcopy(bmodel_template)
         full_model = _fit_sklearn(full_model, bname, task_type, X_train, y_train)
@@ -255,6 +365,14 @@ def precompute_oof(X_train: np.ndarray, y_train: np.ndarray,
     mlp_full = _build_mlp_fresh(input_dim, task_type, n_classes)
     mlp_full = _fit_mlp(mlp_full, X_train, y_train)
     trained_bases['MLP'] = mlp_full
+    # Note: K.clear_session() is intentionally NOT called here — the full-data
+    # MLP must remain live for get_test_meta_features().
+
+    # FTT full retrain
+    ftt_full = _build_ftt_fresh(input_dim, task_type, n_classes)
+    ftt_full = _fit_ftt(ftt_full, X_train, y_train, device)
+    trained_bases['FTT'] = ftt_full
+    # Note: _cleanup_ftt() intentionally NOT called — model must stay live.
 
     return oof_matrix, trained_bases, BASE_NAMES
 
@@ -263,8 +381,8 @@ def train_meta_learner(oof_matrix: np.ndarray, y_train: np.ndarray,
                        meta_C: float = 1.0) -> LogisticRegression:
     """
     Trains a Logistic Regression meta-learner (Level 1) on the OOF feature matrix.
-    Input shape: (n_train, 6) for binary, (n_train, 6*C) for multiclass.
-    The 6 columns represent one base learner signal each — MLP included.
+    Input shape: (n_train, 7) for binary, (n_train, 7*C) for multiclass.
+    The 7 columns represent one base learner signal each — MLP and FTT included.
     """
     meta = LogisticRegression(
         C=meta_C, max_iter=2000, random_state=42,
@@ -277,9 +395,10 @@ def train_meta_learner(oof_matrix: np.ndarray, y_train: np.ndarray,
 def get_test_meta_features(trained_bases: dict, X_test: np.ndarray,
                             task_type: str, n_classes: int) -> np.ndarray:
     """
-    Builds the (n_test, 6) or (n_test, 6*C) test meta-feature matrix using
+    Builds the (n_test, 7) or (n_test, 7*C) test meta-feature matrix using
     base learners trained on the full training set.
     """
+    device      = _get_device()
     n_test      = X_test.shape[0]
     test_matrix = np.zeros(_oof_matrix_shape(n_test, task_type, n_classes),
                            dtype=np.float64)
@@ -288,6 +407,8 @@ def get_test_meta_features(trained_bases: dict, X_test: np.ndarray,
         model = trained_bases[bname]
         if bname == 'MLP':
             proba = _predict_proba_mlp(model, task_type, X_test)
+        elif bname == 'FTT':
+            proba = _predict_proba_ftt(model, task_type, X_test, device)
         else:
             proba = _predict_proba_sklearn(model, bname, task_type, X_test)
         _fill_slot(test_matrix, slice(None), b_idx, proba, task_type, n_classes)
@@ -304,7 +425,7 @@ def run_stacking_for_tournament(
     """
     Complete stacking pipeline for one (target, matrix) slot in the tournament.
 
-    Level 0 base learners : CB, XGB, LGB, RF, LR, MLP  (6 models)
+    Level 0 base learners : CB, XGB, LGB, RF, LR, MLP, FTT  (7 models)
     Level 1 meta-learner  : Logistic Regression
 
     Parameters
@@ -313,7 +434,7 @@ def run_stacking_for_tournament(
     y_train, y_test       : encoded label arrays
     task_type             : 'binary' | 'multiclass'
     n_classes             : number of target classes
-    input_dim             : X_train.shape[1] — required to build the MLP graph
+    input_dim             : X_train.shape[1] — required to build MLP + FTT graphs
     meta_C                : regularisation strength for the LR meta-learner
 
     Returns

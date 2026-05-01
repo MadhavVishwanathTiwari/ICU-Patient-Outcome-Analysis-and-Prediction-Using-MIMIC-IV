@@ -63,19 +63,23 @@ import tensorflow.keras.backend as K
 # Update WINNING_CONFIGS here once the tournament finishes and you know
 # whether Stacking Ensemble won any target.  Example entry:
 #   'aki_onset': {'model': 'Stacking Ensemble', 'matrix': 'MI', 'type': 'binary', 'baseline_auc': 0.8251}
+# ─────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+
 WINNING_CONFIGS = {
-    'mortality':             {'model': 'CatBoost',            'matrix': 'LASSO', 'type': 'binary',     'baseline_auc': 0.8898},
-    'aki_onset':             {'model': 'Custom MLP',          'matrix': 'LASSO', 'type': 'binary',     'baseline_auc': 0.8187},
-    'sepsis_onset':          {'model': 'Random Forest',       'matrix': 'MI',    'type': 'binary',     'baseline_auc': 0.7805},
-    'ards_onset':            {'model': 'CatBoost',            'matrix': 'MI',    'type': 'binary',     'baseline_auc': 0.9351},
-    'liver_injury_onset':    {'model': 'CatBoost',            'matrix': 'IG',    'type': 'binary',     'baseline_auc': 0.9232},
-    'need_vent_any':         {'model': 'CatBoost',            'matrix': 'MI',    'type': 'binary',     'baseline_auc': 0.8909},
-    'need_vasopressor_any':  {'model': 'CatBoost',            'matrix': 'MI',    'type': 'binary',     'baseline_auc': 0.8816},
-    'need_rrt_any':          {'model': 'Custom MLP',          'matrix': 'IG',    'type': 'binary',     'baseline_auc': 0.9417},
-    'icu_readmit_48h':       {'model': 'Logistic Regression', 'matrix': 'ANOVA', 'type': 'binary',     'baseline_auc': 0.5948},
-    'icu_readmit_7d':        {'model': 'Logistic Regression', 'matrix': 'ANOVA', 'type': 'binary',     'baseline_auc': 0.6015},
-    'los_category':          {'model': 'Custom MLP',          'matrix': 'LASSO', 'type': 'multiclass', 'baseline_auc': 0.7666},
-    'discharge_disposition': {'model': 'XGBoost',             'matrix': 'LASSO', 'type': 'multiclass', 'baseline_auc': 0.8135},
+    'mortality':             {'model': 'Stacking Ensemble', 'matrix': 'LASSO', 'type': 'binary',     'baseline_auc': 0.8987},
+    'aki_onset':             {'model': 'Stacking Ensemble', 'matrix': 'MI',    'type': 'binary',     'baseline_auc': 0.8301},
+    'sepsis_onset':          {'model': 'Stacking Ensemble', 'matrix': 'MI',    'type': 'binary',     'baseline_auc': 0.7903},
+    'ards_onset':            {'model': 'Stacking Ensemble', 'matrix': 'MI',    'type': 'binary',     'baseline_auc': 0.9366},
+    'liver_injury_onset':    {'model': 'Stacking Ensemble', 'matrix': 'LASSO', 'type': 'binary',     'baseline_auc': 0.9291},
+    'icu_readmit_48h':       {'model': 'Stacking Ensemble', 'matrix': 'ANOVA', 'type': 'binary',     'baseline_auc': 0.6107},
+    'icu_readmit_7d':        {'model': 'Stacking Ensemble', 'matrix': 'IG',    'type': 'binary',     'baseline_auc': 0.6266},
+    'los_category':          {'model': 'CatBoost',          'matrix': 'LASSO', 'type': 'multiclass', 'baseline_auc': 0.7641},
+    'discharge_disposition': {'model': 'CatBoost',          'matrix': 'LASSO', 'type': 'multiclass', 'baseline_auc': 0.8126},
+    'need_vent_any':         {'model': 'Stacking Ensemble', 'matrix': 'MI',    'type': 'binary',     'baseline_auc': 0.8953},
+    'need_vasopressor_any':  {'model': 'Stacking Ensemble', 'matrix': 'MI',    'type': 'binary',     'baseline_auc': 0.8867},
+    'need_rrt_any':          {'model': 'Stacking Ensemble', 'matrix': 'IG',    'type': 'binary',     'baseline_auc': 0.9488},
 }
 
 MATRIX_FILES = {
@@ -255,7 +259,8 @@ def final_evaluate_stacking(target_name, config, best_params,
     if precomputed_oof is None or pretrained_bases is None:
         from src.models.stacking_model import precompute_oof
         precomputed_oof, pretrained_bases, _ = precompute_oof(
-            X_train, y_train, task_type, n_classes
+            X_train, y_train, task_type, n_classes,
+            input_dim=X_train.shape[1]   # FIX: required to build MLP + FTT graphs
         )
 
     meta_C = best_params.get('meta_C', 1.0)
@@ -442,7 +447,8 @@ def main():
             # Phase A: pre-compute OOF once (expensive, done only once per target)
             print("   [Stacking] Phase A — pre-computing OOF predictions...")
             oof_matrix, pretrained_bases, base_names = precompute_oof(
-                X_train, y_train, config['type'], n_classes
+                X_train, y_train, config['type'], n_classes,
+                input_dim=X_train.shape[1]   # FIX: required to build MLP + FTT graphs
             )
             print(f"   [Stacking] OOF matrix shape: {oof_matrix.shape}  "
                   f"(base learners: {base_names})")

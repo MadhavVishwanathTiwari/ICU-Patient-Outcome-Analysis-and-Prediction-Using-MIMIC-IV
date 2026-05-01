@@ -1,98 +1,98 @@
 {
   "mortality": {
     "Target": "mortality",
-    "Model": "CatBoost",
+    "Model": "Stacking Ensemble",
     "Matrix": "LASSO",
-    "Baseline AUC": 0.8898,
-    "Tuned AUC": 0.8960075125571006,
-    "Delta": 0.006207512557100614
+    "Baseline AUC": 0.8987,
+    "Tuned AUC": 0.896844822270902,
+    "Delta": -0.0018551777290980453
   },
   "aki_onset": {
     "Target": "aki_onset",
-    "Model": "Custom MLP",
-    "Matrix": "LASSO",
-    "Baseline AUC": 0.8187,
-    "Tuned AUC": 0.8184308975999994,
-    "Delta": -0.00026910240000055374
+    "Model": "Stacking Ensemble",
+    "Matrix": "MI",
+    "Baseline AUC": 0.8301,
+    "Tuned AUC": 0.8284376488907486,
+    "Delta": -0.001662351109251392
   },
   "sepsis_onset": {
     "Target": "sepsis_onset",
-    "Model": "Random Forest",
+    "Model": "Stacking Ensemble",
     "Matrix": "MI",
-    "Baseline AUC": 0.7805,
-    "Tuned AUC": 0.7841,
-    "Delta": 0.0036
+    "Baseline AUC": 0.7903,
+    "Tuned AUC": 0.7910959157095291,
+    "Delta": 0.0007959157095290825
   },
   "ards_onset": {
     "Target": "ards_onset",
-    "Model": "CatBoost",
+    "Model": "Stacking Ensemble",
     "Matrix": "MI",
-    "Baseline AUC": 0.9351,
-    "Tuned AUC": 0.9373,
-    "Delta": 0.0022
+    "Baseline AUC": 0.9366,
+    "Tuned AUC": 0.93741770419191,
+    "Delta": 0.0008177041919099626
   },
   "liver_injury_onset": {
     "Target": "liver_injury_onset",
-    "Model": "CatBoost",
-    "Matrix": "IG",
-    "Baseline AUC": 0.9232,
-    "Tuned AUC": 0.929,
-    "Delta": 0.0058
+    "Model": "Stacking Ensemble",
+    "Matrix": "LASSO",
+    "Baseline AUC": 0.9291,
+    "Tuned AUC": 0.9294020429005339,
+    "Delta": 0.00030204290053381655
   },
   "icu_readmit_48h": {
     "Target": "icu_readmit_48h",
-    "Model": "Logistic Regression",
+    "Model": "Stacking Ensemble",
     "Matrix": "ANOVA",
-    "Baseline AUC": 0.5948,
-    "Tuned AUC": 0.5919,
-    "Delta": -0.0029
+    "Baseline AUC": 0.6107,
+    "Tuned AUC": 0.6091704280314222,
+    "Delta": -0.0015295719685778364
   },
   "icu_readmit_7d": {
     "Target": "icu_readmit_7d",
-    "Model": "Logistic Regression",
-    "Matrix": "ANOVA",
-    "Baseline AUC": 0.6015,
-    "Tuned AUC": 0.6031,
-    "Delta": 0.0016
+    "Model": "Stacking Ensemble",
+    "Matrix": "IG",
+    "Baseline AUC": 0.6266,
+    "Tuned AUC": 0.6266763550742688,
+    "Delta": 7.635507426873023e-05
   },
   "los_category": {
     "Target": "los_category",
-    "Model": "Custom MLP",
+    "Model": "CatBoost",
     "Matrix": "LASSO",
-    "Baseline AUC": 0.7666,
-    "Tuned AUC": 0.7681,
-    "Delta": 0.0015
+    "Baseline AUC": 0.7641,
+    "Tuned AUC": 0.7752255400915437,
+    "Delta": 0.01112554009154365
   },
   "discharge_disposition": {
     "Target": "discharge_disposition",
-    "Model": "XGBoost",
+    "Model": "CatBoost",
     "Matrix": "LASSO",
-    "Baseline AUC": 0.8135,
-    "Tuned AUC": 0.8239,
-    "Delta": 0.0104
+    "Baseline AUC": 0.8126,
+    "Tuned AUC": 0.8211066183649223,
+    "Delta": 0.00850661836492228
   },
   "need_vent_any": {
     "Target": "need_vent_any",
-    "Model": "CatBoost",
+    "Model": "Stacking Ensemble",
     "Matrix": "MI",
-    "Baseline AUC": 0.8909,
-    "Tuned AUC": 0.8959510549482025,
-    "Delta": 0.00505105494820246
+    "Baseline AUC": 0.8953,
+    "Tuned AUC": 0.8959181841293323,
+    "Delta": 0.0006181841293323442
   },
   "need_vasopressor_any": {
     "Target": "need_vasopressor_any",
-    "Model": "CatBoost",
+    "Model": "Stacking Ensemble",
     "Matrix": "MI",
-    "Baseline AUC": 0.8816,
-    "Tuned AUC": 0.8854539231086295,
-    "Delta": 0.00385392310862942
+    "Baseline AUC": 0.8867,
+    "Tuned AUC": 0.8872280371531435,
+    "Delta": 0.0005280371531434236
   },
   "need_rrt_any": {
     "Target": "need_rrt_any",
-    "Model": "Custom MLP",
+    "Model": "Stacking Ensemble",
     "Matrix": "IG",
-    "Baseline AUC": 0.9417,
-    "Tuned AUC": 0.9443831624274155,
-    "Delta": 0.0026831624274155086
+    "Baseline AUC": 0.9488,
+    "Tuned AUC": 0.9467772427160126,
+    "Delta": -0.0020227572839873753
   }
 }

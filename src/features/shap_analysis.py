@@ -262,7 +262,8 @@ def train_model(model_name, params, task_type, n_classes, X_train, y_train):
         # ── NEW ──────────────────────────────────────────────────────────
         meta_C = params.get('meta_C', 1.0)
         oof_matrix, trained_bases, base_names = precompute_oof(
-            X_train.values, y_train, task_type, n_classes
+            X_train.values, y_train, task_type, n_classes,
+            input_dim=X_train.shape[1]   # FIX: required to build MLP + FTT graphs
         )
         meta           = train_meta_learner(oof_matrix, y_train, meta_C)
         oof_feat_names = get_oof_feature_names(base_names, task_type, n_classes)
@@ -688,7 +689,7 @@ def main():
     print("  <target>_bar.png       — global importance (mean |SHAP|)")
     print("  <target>_waterfall.png — highest-risk patient breakdown")
     print("\nNote for Stacking Ensemble targets:")
-    print("  Feature names in plots = base learner short codes (CB, XGB, LGB, RF, LR).")
+    print("  Feature names in plots = base learner short codes (CB, XGB, LGB, RF, LR, MLP, FTT).")
     print("  SHAP values show which base learner the meta-learner relies on most.")
     print("\n[NEXT] Review beeswarm plots for clinical sanity-checking.")
 

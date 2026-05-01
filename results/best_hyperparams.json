@@ -1,146 +1,92 @@
 {
   "mortality": {
-    "model": "CatBoost",
+    "model": "Stacking Ensemble",
     "matrix": "LASSO",
     "params": {
-      "iterations": 775,
-      "learning_rate": 0.018536673161180843,
-      "depth": 8,
-      "l2_leaf_reg": 4.455265811425704
+      "meta_C": 0.138764539300629
     }
   },
   "aki_onset": {
-    "model": "Custom MLP",
-    "matrix": "LASSO",
+    "model": "Stacking Ensemble",
+    "matrix": "MI",
     "params": {
-      "units_1": 256,
-      "units_2": 128,
-      "units_3": 32,
-      "dropout_1": 0.30003757649057683,
-      "dropout_2": 0.27898615832272006,
-      "lr": 0.00018454425263625157,
-      "batch_size": 64
+      "meta_C": 0.4042872735027334
     }
   },
   "sepsis_onset": {
-    "model": "Random Forest",
+    "model": "Stacking Ensemble",
     "matrix": "MI",
     "params": {
-      "n_estimators": 497,
-      "max_depth": 23,
-      "min_samples_split": 18,
-      "min_samples_leaf": 2,
-      "max_features": "sqrt"
+      "meta_C": 0.2866531534841772
     }
   },
   "ards_onset": {
-    "model": "CatBoost",
+    "model": "Stacking Ensemble",
     "matrix": "MI",
     "params": {
-      "iterations": 626,
-      "learning_rate": 0.032070504351672614,
-      "depth": 8,
-      "l2_leaf_reg": 3.8004142432596173,
-      "bagging_temperature": 0.33988723211106797,
-      "random_strength": 0.006558938876281778,
-      "border_count": 220
+      "meta_C": 0.03478695709031253
     }
   },
   "liver_injury_onset": {
-    "model": "CatBoost",
-    "matrix": "IG",
+    "model": "Stacking Ensemble",
+    "matrix": "LASSO",
     "params": {
-      "iterations": 940,
-      "learning_rate": 0.022783686937666827,
-      "depth": 8,
-      "l2_leaf_reg": 4.741492363723821,
-      "bagging_temperature": 0.3768346972312249,
-      "random_strength": 6.928492584043765,
-      "border_count": 71
+      "meta_C": 0.08581463810008448
     }
   },
   "need_vent_any": {
-    "model": "CatBoost",
+    "model": "Stacking Ensemble",
     "matrix": "MI",
     "params": {
-      "iterations": 999,
-      "learning_rate": 0.05215348882147988,
-      "depth": 7,
-      "l2_leaf_reg": 1.3655970974733718,
-      "bagging_temperature": 0.6098939964024768,
-      "random_strength": 0.9782218798053375,
-      "border_count": 37
+      "meta_C": 0.03637379558845481
     }
   },
   "need_vasopressor_any": {
-    "model": "CatBoost",
+    "model": "Stacking Ensemble",
     "matrix": "MI",
     "params": {
-      "iterations": 812,
-      "learning_rate": 0.031262480955702776,
-      "depth": 8,
-      "l2_leaf_reg": 2.2872144806011248,
-      "bagging_temperature": 0.21722703165959178,
-      "random_strength": 0.0022771687470312923,
-      "border_count": 158
+      "meta_C": 0.07044522038057942
     }
   },
   "need_rrt_any": {
-    "model": "Custom MLP",
+    "model": "Stacking Ensemble",
     "matrix": "IG",
     "params": {
-      "units_1": 256,
-      "units_2": 128,
-      "units_3": 32,
-      "dropout_1": 0.47404389551881826,
-      "dropout_2": 0.3237298081893396,
-      "lr": 0.001038200362144166,
-      "batch_size": 64
+      "meta_C": 0.001284989931446111
     }
   },
   "icu_readmit_48h": {
-    "model": "Logistic Regression",
+    "model": "Stacking Ensemble",
     "matrix": "ANOVA",
     "params": {
-      "penalty": "elasticnet",
-      "C": 0.0010547383621352044,
-      "l1_ratio": 0.06505159298527952
+      "meta_C": 3.0262268425885344
     }
   },
   "icu_readmit_7d": {
-    "model": "Logistic Regression",
-    "matrix": "ANOVA",
+    "model": "Stacking Ensemble",
+    "matrix": "IG",
     "params": {
-      "penalty": "l2",
-      "C": 0.0002904037731360634
+      "meta_C": 5.580606124949734
     }
   },
   "los_category": {
-    "model": "Custom MLP",
+    "model": "CatBoost",
     "matrix": "LASSO",
     "params": {
-      "units_1": 256,
-      "units_2": 64,
-      "units_3": 64,
-      "dropout_1": 0.3922484113797764,
-      "dropout_2": 0.2077497932694451,
-      "lr": 0.00036916787100040553,
-      "batch_size": 32
+      "iterations": 908,
+      "learning_rate": 0.046331080542083146,
+      "depth": 8,
+      "l2_leaf_reg": 1.912972437863448
     }
   },
   "discharge_disposition": {
-    "model": "XGBoost",
+    "model": "CatBoost",
     "matrix": "LASSO",
     "params": {
-      "n_estimators": 958,
-      "learning_rate": 0.013943116780134197,
-      "max_depth": 10,
-      "min_child_weight": 10,
-      "subsample": 0.759571902132866,
-      "colsample_bytree": 0.8674151263159562,
-      "gamma": 1.0876003204021,
-      "reg_alpha": 0.06913061152948329,
-      "reg_lambda": 1.4485692400413837
+      "iterations": 1000,
+      "learning_rate": 0.02740745098198247,
+      "depth": 9,
+      "l2_leaf_reg": 0.002757082363876834
     }
   }
 }

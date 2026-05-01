@@ -1,9 +1,9 @@
 """
 Phase 3: The Complete Matrix Tournament (Optimized I/O & Architecture)
-Evaluates 12 Clinical Targets across 4 Mathematical Matrices using 7 Models.
+Evaluates 12 Clinical Targets across 4 Mathematical Matrices using 8 Models.
 
 Models  : CatBoost, XGBoost, LightGBM, Random Forest, Logistic Regression,
-          Custom MLP, Stacking Ensemble   → 12 × 7 × 4 = 336 combinations
+          Custom MLP, FT-Transformer, Stacking Ensemble → 12 × 8 × 4 = 384 combinations
 Outputs : Markdown tables + winning ROC curves saved as PNGs
 """
 
@@ -20,7 +20,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 from src.features.leakage_rules import drop_organ_support_leaky_columns
 from src.models.custom_mlp import build_custom_mlp, compute_class_weights
-from src.models.stacking_model import run_stacking_for_tournament   # ← NEW
+from src.models.stacking_model import run_stacking_for_tournament
+from src.models.ft_transformer import build_ftt, train_ftt, predict_ftt, get_device
 
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
@@ -51,10 +52,10 @@ MATRICES = {
     'MI': 'X_mi_union.csv', 'LASSO': 'X_lasso_union.csv'
 }
 
-# Stacking Ensemble added as 7th model → 12 × 7 × 4 = 336 total combinations
+# FT-Transformer added as 8th model → 12 × 8 × 4 = 384 total combinations
 MODEL_NAMES = [
     'CatBoost', 'XGBoost', 'LightGBM', 'Random Forest',
-    'Logistic Regression', 'Custom MLP', 'Stacking Ensemble'
+    'Logistic Regression', 'Custom MLP', 'FT-Transformer', 'Stacking Ensemble'
 ]
 
 
@@ -134,8 +135,10 @@ def plot_winning_roc(target_name, model_name, matrix_name, best_auc,
 
 def run_full_tournament():
     print("=" * 80)
-    print("INITIALIZING MATRIX TOURNAMENT  (7 models × 4 matrices × 12 targets = 336 slots)")
+    print("INITIALIZING MATRIX TOURNAMENT  (8 models × 4 matrices × 12 targets = 384 slots)")
     print("=" * 80)
+
+    device = get_device()   # CUDA → MPS → CPU; resolved once, reused across all slots
 
     data_dir = Path('data/processed/tournament')
     out_dir  = Path('results/roc_curves')
@@ -266,7 +269,51 @@ def run_full_tournament():
             K.clear_session()
             gc.collect()
 
-            # ── Stacking Ensemble (7th competitor) ───────────────────────
+            # ── FT-Transformer (8th standalone competitor) ────────────────
+            # Rebuilt fresh per (target, matrix) slot — no weight sharing.
+            # GPU memory freed immediately after prediction via del + gc.
+            print(f"  [+] Training FT-Transformer      on {matrix_name:5}...", end='\r')
+            try:
+                ftt_model = build_ftt(
+                    input_dim=X_train_scaled.shape[1],
+                    task_type=task_type,
+                    n_classes=n_classes,
+                )
+                ftt_model = train_ftt(
+                    model=ftt_model,
+                    X_tr=X_train_scaled,
+                    y_tr=y_train,
+                    device=device,
+                    epochs=50,
+                    batch_size=256,
+                    patience=5,
+                    val_fraction=0.15,
+                )
+                ftt_preds = predict_ftt(ftt_model, X_test_scaled, device, task_type)
+                ftt_auc = (
+                    roc_auc_score(y_test, ftt_preds)
+                    if task_type == 'binary'
+                    else roc_auc_score(y_test, ftt_preds, multi_class='ovr', average='macro')
+                )
+                results[target_name]['FT-Transformer'][matrix_name] = ftt_auc
+                if ftt_auc > best_auc:
+                    best_auc, best_model_name, best_matrix_name = ftt_auc, 'FT-Transformer', matrix_name
+                    best_y_test, best_preds, best_n_classes = y_test.copy(), ftt_preds.copy(), n_classes
+            except Exception as exc:
+                print(f"\n  [!] FT-Transformer failed for {target_name}/{matrix_name}: {exc}")
+                results[target_name]['FT-Transformer'][matrix_name] = None
+            finally:
+                # Free GPU/CPU memory regardless of success or failure
+                try:
+                    del ftt_model
+                except NameError:
+                    pass
+                gc.collect()
+                if device.type == 'cuda':
+                    import torch
+                    torch.cuda.empty_cache()
+
+            # ── Stacking Ensemble (8th competitor, was 7th) ───────────────
             # Level 0: CB, XGB, LGB, RF, LR, MLP  (6 base learners)
             # Level 1: Logistic Regression meta-learner
             # MLP at Level 0 adds neural diversity alongside the 5 tree/linear
