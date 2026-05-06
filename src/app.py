@@ -24,13 +24,61 @@ import os, json, warnings
 warnings.filterwarnings('ignore')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
+import sys
+from pathlib import Path
+# Ensure repo root is on sys.path so pickled artifacts referencing `src.*` can import.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-from pathlib import Path
 import plotly.express as px
 import plotly.graph_objects as go
+
+def _joblib_load_with_torch_cpu_map(path):
+    """
+    Some saved artifacts (stacking incl. PyTorch FTT) may have been serialized on CUDA.
+    Patch torch.load during unpickle so CUDA tensors map to CPU at load time.
+    """
+    try:
+        import joblib as _joblib
+        import torch as _torch
+
+        orig = _torch.load
+
+        def patched(*args, **kwargs):
+            kwargs.setdefault("map_location", _torch.device("cpu"))
+            return orig(*args, **kwargs)
+
+        _torch.load = patched
+        try:
+            return _joblib.load(path)
+        finally:
+            _torch.load = orig
+    except Exception:
+        # fall back to plain joblib (will raise the original error if incompatible)
+        return joblib.load(path)
+
+def _ensure_sklearn_imputer_compat(imputer):
+    """
+    Patch-only: scikit-learn model persistence across versions can miss internal attrs.
+    We add the minimal missing attrs needed for transform() in newer versions.
+    """
+    try:
+        import numpy as _np
+        # sklearn>=1.7 SimpleImputer.transform may expect _fill_dtype; older pickles may only have _fit_dtype
+        if hasattr(imputer, "statistics_") and not hasattr(imputer, "_fill_dtype"):
+            fit_dtype = getattr(imputer, "_fit_dtype", None)
+            if fit_dtype is not None:
+                imputer._fill_dtype = fit_dtype
+            else:
+                imputer._fill_dtype = _np.dtype("float64")
+        return imputer
+    except Exception:
+        return imputer
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -113,29 +161,41 @@ def load_all_models():
     preps  = {}
 
     for target in params:
+        target_cfg = params.get(target) or {}
+        target_model = target_cfg.get("model")
+
         prep_path = MODELS_DIR / f'{target}_prep.pkl'
         if not prep_path.exists():
             continue
         preps[target] = joblib.load(prep_path)
 
-        keras_path = MODELS_DIR / f'{target}_keras.keras'
-        keras_dir  = MODELS_DIR / f'{target}_keras'
-        pkl_path   = MODELS_DIR / f'{target}.pkl'
+        keras_path    = MODELS_DIR / f'{target}_keras.keras'
+        keras_dir     = MODELS_DIR / f'{target}_keras'
+        mlp_path      = MODELS_DIR / f'{target}_mlp.keras'
+        stacking_path = MODELS_DIR / f'{target}_stacking.pkl'
+        pkl_path      = MODELS_DIR / f'{target}.pkl'
 
-        if keras_path.exists():
-            try:
+        # Decide which artifact to load from params (source of truth).
+        try:
+            if target_model == "Stacking Ensemble" and stacking_path.exists():
+                models[target] = _joblib_load_with_torch_cpu_map(stacking_path)
+            elif target_model == "Custom MLP" and (mlp_path.exists() or keras_path.exists() or keras_dir.exists()):
                 import tensorflow as tf
-                models[target] = tf.keras.models.load_model(str(keras_path))
-            except Exception:
-                pass
-        elif keras_dir.exists():
-            try:
-                import tensorflow as tf
-                models[target] = tf.keras.models.load_model(str(keras_dir))
-            except Exception:
-                pass
-        elif pkl_path.exists():
-            models[target] = joblib.load(pkl_path)
+                src_path = mlp_path if mlp_path.exists() else (keras_path if keras_path.exists() else keras_dir)
+                models[target] = tf.keras.models.load_model(str(src_path))
+            else:
+                # Non-neural sklearn/xgb/cb models (prefer explicit <target>.pkl; else <target>_<safe>.pkl)
+                if not pkl_path.exists() and isinstance(target_model, str):
+                    safe = target_model.lower().replace(" ", "_")
+                    candidate = MODELS_DIR / f"{target}_{safe}.pkl"
+                    if candidate.exists():
+                        pkl_path = candidate
+                if pkl_path.exists():
+                    models[target] = joblib.load(pkl_path)
+                # else: skip silently
+        except Exception as e:
+            # Keep loading other targets if one fails.
+            pass
 
     return models, preps
 
@@ -173,25 +233,49 @@ def predict_for_patient(target: str, patient_raw: pd.Series,
         return None, None
 
     prep      = preps[target]
-    feat_cols = prep['feature_cols']
-    imputer   = prep['imputer']
-    scaler    = prep['scaler']
-    task_type = prep['task_type']
+
+    if not isinstance(prep, dict):
+        return None, None
+
+    # Backward/forward compatibility with saved prep dict formats
+    feat_cols = prep.get('feature_cols') or prep.get('features')
+    imputer   = prep.get('imputer')
+    scaler    = prep.get('scaler')
+    task_type = prep.get('task_type') or TASK_TYPE.get(target, 'binary')
+
+    if not isinstance(feat_cols, (list, tuple)) or imputer is None or scaler is None:
+        return None, None
     model     = models[target]
+
+    imputer = _ensure_sklearn_imputer_compat(imputer)
 
     # Build feature vector (fill missing cols with NaN)
     x = np.array([patient_raw.get(c, np.nan) for c in feat_cols]).reshape(1, -1)
+
     x = imputer.transform(x)
     x = scaler.transform(x)
-
+    # Ensure numeric dtype that TF/Keras reliably accepts
     try:
-        if hasattr(model, 'predict_proba'):
+        x = np.asarray(x, dtype=np.float32)
+    except Exception:
+        pass
+    try:
+        # Stacking artifact (dict with meta + trained_bases)
+        if isinstance(model, dict) and ("meta" in model) and ("trained_bases" in model):
+            from src.models.stacking_model import get_test_meta_features
+            n_classes = int(model.get("n_classes", 2))
+            stack_task = model.get("task_type") or task_type
+            test_meta = get_test_meta_features(model["trained_bases"], x, stack_task, n_classes)
+            proba = model["meta"].predict_proba(test_meta)[0]
+            if stack_task == "binary":
+                proba = np.array([1.0 - float(proba[1]), float(proba[1])], dtype=float)
+        elif hasattr(model, 'predict_proba'):
             proba = model.predict_proba(x)[0]
         else:
             # Keras model
             raw = model.predict(x, verbose=0)
             proba = raw.flatten() if task_type == 'binary' else raw[0]
-    except Exception:
+    except Exception as e:
         return None, None
 
     if task_type == 'binary':
